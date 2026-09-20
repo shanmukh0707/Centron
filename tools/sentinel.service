@@ -15,6 +15,12 @@ Documentation=file://__ROOT__/docs/contracts.md
 After=network-online.target tailscaled.service
 Wants=network-online.target
 
+# A crash loop should be visible, not silent. More than 5 restarts in 2 minutes
+# and systemd gives up, leaving the failure on the unit for someone to find.
+# These belong in [Unit]; systemd ignores them under [Service].
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
 [Service]
 Type=simple
 User=__USER__
@@ -33,6 +39,9 @@ Environment=SENTINEL_ASSETS_FILE=__ROOT__/tools/protected_assets.serverpi.yaml
 # --live-ollama      the model on the PC, via OLLAMA_BASE_URL
 # --db               persist events and the redaction map across restarts
 # --certfile/keyfile wss://, which the app requires and pins
+# --advertise        audio URLs must carry the Tailscale address. The default
+#                    is the detected LAN IP, which the phone cannot reach from
+#                    the venue -- the same failure the cert SAN guards against.
 #
 # Executor stays in dry run: --live is deliberately absent. Invariant 10.
 ExecStart=__ROOT__/backend/.venv/bin/python stub_server.py \
@@ -43,15 +52,11 @@ ExecStart=__ROOT__/backend/.venv/bin/python stub_server.py \
     --certfile __ROOT__/backend/certs/cert.pem \
     --keyfile __ROOT__/backend/certs/key.pem \
     --host 0.0.0.0 \
-    --port 8765
+    --port 8765 \
+    --advertise 100.110.30.122
 
 Restart=always
 RestartSec=5
-
-# A crash loop should be visible, not silent. If it restarts more than 5 times
-# in 2 minutes, stop and leave the failure on the unit for someone to find.
-StartLimitBurst=5
-StartLimitIntervalSec=120
 
 StandardOutput=journal
 StandardError=journal
