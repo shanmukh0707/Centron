@@ -510,7 +510,13 @@ private fun Shell(
                 onTogglePower = { device, on ->
                     scope.launch { notice = changePower(activity, device, on) }
                 },
-                onOpenChat = { onRoute(Route.Chat(ChatScope.Fleet)) },
+                onAsk = { question ->
+                    // Open the conversation first, then send. The other order
+                    // shows an empty chat for a beat before the question you
+                    // just typed appears in it.
+                    onRoute(Route.Chat(ChatScope.Fleet))
+                    scope.launch { ChatController.send(ChatScope.Fleet, question) }
+                },
             )
         }
     }

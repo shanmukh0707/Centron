@@ -8,10 +8,15 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,6 +37,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -42,6 +48,12 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import com.centron.sentinel.R
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import com.centron.sentinel.device.Capability
@@ -72,7 +84,8 @@ fun HomeScreen(
     onAddDevice: () -> Unit,
     onOpenDevice: (Device) -> Unit,
     onTogglePower: (Device, Boolean) -> Unit,
-    onOpenChat: () -> Unit,
+    /** Opens fleet chat with this question already asked. */
+    onAsk: (String) -> Unit,
 ) {
     var revealed by remember { mutableIntStateOf(0) }
     LaunchedEffect(Unit) {
@@ -98,7 +111,7 @@ fun HomeScreen(
         }
 
         item {
-            Fade(revealed >= 1) { AskBar(onOpenChat) }
+            Fade(revealed >= 1) { AskBar(onAsk) }
             Spacer(Modifier.height(Space.Xl))
         }
 
@@ -151,31 +164,69 @@ fun HomeScreen(
  * field implies you can just start typing, which is the whole point.
  */
 @Composable
-private fun AskBar(onClick: () -> Unit) {
+private fun AskBar(onSubmit: (String) -> Unit) {
+    var draft by remember { mutableStateOf("") }
+    val focus = LocalFocusManager.current
+    val ready = draft.isNotBlank()
+
+    fun submit() {
+        if (!ready) return
+        onSubmit(draft.trim())
+        draft = ""
+        // The conversation opens on the next screen; leaving the keyboard up
+        // over it looks like the question did not send.
+        focus.clearFocus()
+    }
+
     Row(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
             .background(Ink.Surface)
             .border(Space.Hair, Ink.Hairline, RoundedCornerShape(16.dp))
-            .clickable(onClick = onClick)
-            .padding(horizontal = Space.Md, vertical = 15.dp),
+            .padding(horizontal = Space.Md, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            "Ask Centron about your homelab…",
-            style = MaterialTheme.typography.bodyLarge,
-            color = Ink.Tertiary,
+        BasicTextField(
+            value = draft,
+            onValueChange = { draft = it },
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = Ink.Primary),
+            cursorBrush = SolidColor(Accent.Clay),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+            keyboardActions = KeyboardActions(onSend = { submit() }),
+            modifier = Modifier
+                .weight(1f)
+                .padding(vertical = 9.dp),
+            decorationBox = { inner ->
+                if (draft.isEmpty()) {
+                    Text(
+                        "Ask Centron about your homelab…",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = Ink.Tertiary,
+                    )
+                }
+                inner()
+            },
         )
-        Spacer(Modifier.weight(1f))
+
+        Spacer(Modifier.width(Space.Sm))
+
         Box(
             Modifier
                 .size(30.dp)
                 .clip(CircleShape)
-                .background(Accent.ClaySubtle),
+                // Dimmed until there is something to send, so the control says
+                // whether it will do anything before it is pressed.
+                .background(if (ready) Accent.ClaySubtle else Ink.Raised)
+                .clickable(enabled = ready) { submit() },
             contentAlignment = Alignment.Center,
         ) {
-            Text("↑", style = MaterialTheme.typography.titleMedium, color = Accent.Clay)
+            Text(
+                "↑",
+                style = MaterialTheme.typography.titleMedium,
+                color = if (ready) Accent.Clay else Ink.Tertiary,
+            )
         }
     }
 }
@@ -221,61 +272,41 @@ private fun greetingFor(hour: Int): String = when (hour) {
 private const val OWNER = "Shamit"
 
 /**
- * PLACEHOLDER LOGO.
+ * The Centron wordmark.
  *
- * A concentric sweep — something watching a perimeter — drawn rather than
- * dropped in as an asset so there is nothing to license and nothing to
- * migrate. Replace the whole composable when the real mark exists; nothing
- * else references its internals.
+ * The asset carries its own near-black background rather than an alpha cut,
+ * so it sits on a dark chip instead of directly on the surface. That keeps it
+ * looking deliberate in the creme theme, where dropping a black rectangle
+ * straight onto a light background would read as a broken image.
  */
 @Composable
 private fun CentronMark() {
-    val transition = rememberInfiniteTransition(label = "mark")
-    val sweep by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = InfiniteRepeatableSpec(
-            animation = tween(9000, easing = androidx.compose.animation.core.LinearEasing),
-            repeatMode = RepeatMode.Restart,
-        ),
-        label = "sweep",
-    )
-
-    // Read out of composition before the draw lambda: token accessors are
-    // @Composable and DrawScope is not.
-    val ring = Ink.Hairline
-    val clay = Accent.Clay
-
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Canvas(Modifier.size(44.dp)) {
-            val s = size.minDimension
-            val c = Offset(s / 2f, s / 2f)
-
-            drawCircle(ring, radius = s * 0.46f, center = c, style = Stroke(width = s * 0.045f))
-            drawCircle(ring, radius = s * 0.30f, center = c, style = Stroke(width = s * 0.045f))
-
-            // The sweep hand. Slow enough to read as patient rather than busy.
-            drawArc(
-                color = clay,
-                startAngle = sweep,
-                sweepAngle = 64f,
-                useCenter = false,
-                topLeft = Offset(s * 0.04f, s * 0.04f),
-                size = Size(s * 0.92f, s * 0.92f),
-                style = Stroke(width = s * 0.045f),
-            )
-            drawCircle(clay, radius = s * 0.075f, center = c)
-        }
-
-        Spacer(Modifier.width(Space.Md))
-
-        Column {
-            Text("CENTRON", style = MaterialTheme.typography.labelSmall, color = Ink.Secondary)
-            Spacer(Modifier.height(2.dp))
-            Text("placeholder mark", style = MonoSmall, color = Ink.Tertiary)
-        }
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(LogoBackdrop)
+            .padding(horizontal = Space.Md, vertical = Space.Sm + Space.Xs),
+    ) {
+        Image(
+            painter = painterResource(R.drawable.centron_wordmark),
+            // Read by screen readers in place of the image; the tagline is
+            // part of the artwork and would otherwise be invisible to them.
+            contentDescription = "Centron — ambient voice security",
+            modifier = Modifier
+                .width(176.dp)
+                .aspectRatio(CENTRON_WORDMARK_RATIO),
+            contentScale = ContentScale.Fit,
+        )
     }
 }
+
+/** 711x194, the asset's own proportions after cropping its margins. Hard-coding
+ *  the ratio keeps the header height stable instead of depending on how the
+ *  drawable decodes. */
+private const val CENTRON_WORDMARK_RATIO = 711f / 194f
+
+/** Matches the artwork's own background so the chip edge is invisible. */
+private val LogoBackdrop = Color(0xFF050505)
 
 // ---------------------------------------------------------------- device card
 
