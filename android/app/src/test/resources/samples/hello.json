@@ -1,0 +1,13 @@
+{
+  "v": 1,
+  "type": "hello",
+  "seq": 1,
+  "ts": "2026-09-19T12:00:00.000Z",
+  "data": {
+    "server_id": "sentinel-stub-01",
+    "contract_version": "1.0.0",
+    "heartbeat_interval_s": 10,
+    "last_event_seq": 42,
+    "resync_buffer_max": 200
+  }
+}

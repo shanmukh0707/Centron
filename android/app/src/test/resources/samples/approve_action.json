@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "type": "approve_action",
+  "seq": 7,
+  "ts": "2026-09-19T12:00:00.000Z",
+  "data": {
+    "approval_id": "apr_0199612eb401",
+    "event_id": "0199612e-b400-7000-8000-00000000c0de",
+    "decision": "approved",
+    "biometric": true
+  }
+}

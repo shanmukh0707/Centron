@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "type": "action_update",
+  "seq": 5,
+  "ts": "2026-09-19T12:00:00.000Z",
+  "data": {
+    "event_id": "0199612e-b400-7000-8000-00000000c0de",
+    "playbook": "block_ip",
+    "status": "approved",
+    "approval_id": "apr_0199612eb401",
+    "expires_at": "2026-09-19T16:00:00.000Z",
+    "reason": "approved on device with biometric"
+  }
+}

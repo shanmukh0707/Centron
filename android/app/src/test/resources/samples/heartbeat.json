@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "type": "heartbeat",
+  "seq": 2,
+  "ts": "2026-09-19T12:00:00.000Z",
+  "data": {
+    "interval_s": 10,
+    "uptime_s": 3600,
+    "last_event_seq": 42,
+    "queue_depth": 0,
+    "pipeline": {
+      "log_source": "ok",
+      "ollama": "ok",
+      "tts": "degraded",
+      "claude": "ok"
+    }
+  }
+}

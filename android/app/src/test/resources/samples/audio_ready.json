@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "type": "audio_ready",
+  "seq": 4,
+  "ts": "2026-09-19T12:00:00.000Z",
+  "data": {
+    "event_id": "0199612e-b400-7000-8000-00000000c0de",
+    "audio": {
+      "status": "ready",
+      "audio_id": "aud_0199612eb400",
+      "url": "http://192.168.1.50:8765/audio/aud_0199612eb400.mp3",
+      "mime": "audio/mpeg",
+      "duration_ms": 1000,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "cache_key": "tts_1f3a9c"
+    }
+  }
+}

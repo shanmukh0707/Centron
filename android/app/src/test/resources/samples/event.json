@@ -1,0 +1,68 @@
+{
+  "v": 1,
+  "type": "event",
+  "seq": 3,
+  "ts": "2026-09-19T12:00:00.000Z",
+  "data": {
+    "event_id": "0199612e-b400-7000-8000-00000000c0de",
+    "signature": "ssh.bruteforce",
+    "severity": "high",
+    "title": "SSH brute force against bastion",
+    "internal_log": "HOST_A attempted 47 SSH logins as USER_1 and USER_2 against bastion in 60s; all failed. Pattern matches ssh.bruteforce. Recommending block_ip on HOST_A.",
+    "tts_summary": "Repeated failed SSH logins from one outside address are waiting for your approval to block.",
+    "confidence": 0.91,
+    "entities": {
+      "src_ips": [
+        "185.220.101.34"
+      ],
+      "dst_hosts": [
+        "bastion"
+      ],
+      "users": [
+        "svc-backup",
+        "root"
+      ],
+      "ports": [
+        22
+      ]
+    },
+    "source": {
+      "kind": "auth",
+      "collector": "sshd",
+      "raw_count": 47
+    },
+    "window": {
+      "start": "2026-09-19T11:59:00.000Z",
+      "end": "2026-09-19T12:00:00.000Z"
+    },
+    "audio": {
+      "status": "ready",
+      "audio_id": "aud_0199612eb400",
+      "url": "http://192.168.1.50:8765/audio/aud_0199612eb400.mp3",
+      "mime": "audio/mpeg",
+      "duration_ms": 1000,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "cache_key": "tts_1f3a9c"
+    },
+    "escalation": {
+      "escalated": false,
+      "gate": null,
+      "reason": null,
+      "state": "none",
+      "verdict": null
+    },
+    "action": {
+      "playbook": "block_ip",
+      "params": {
+        "playbook": "block_ip",
+        "target": "185.220.101.34/32",
+        "duration_sec": 14400
+      },
+      "status": "pending_approval",
+      "requires_approval": true,
+      "expires_at": "2026-09-19T12:02:00.000Z",
+      "approval_id": "apr_0199612eb401"
+    },
+    "reviewed": false
+  }
+}
