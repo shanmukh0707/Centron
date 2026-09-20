@@ -24,6 +24,10 @@ Submission closes 3:00 PM.**
 
 ## MACHINES — who runs what
 
+> **Superseded.** This section described the Saturday-night plan. The actual
+> hardware, network and venue plan is in DEPLOYMENT AND INFRASTRUCTURE at the
+> bottom of this file. Kept for the record.
+
 The GPU box belongs to the Android owner (i7-14700KF, 32GB DDR5, RTX 4070 Super
 12GB). That makes it the Ollama host **and the demo machine**.
 
@@ -226,7 +230,11 @@ Locked decisions:
 ### Phone to server
 
 - `ack { seq }`, optional, delivery accounting
-- `approve_action { approval_id, decision: "approve"|"deny", biometric_assertion, client_ts }`
+- `approve_action { approval_id, event_id, decision: "approved"|"denied", biometric: bool }`
+  (as in `contract.json` and `samples/approve_action.json`; `event_id` must match
+  the approval's event). Note: `biometric: bool` is a claim by the app, not a
+  signed assertion; the pinned cert plus the pre-shared token is what actually
+  authenticates the client.
 - `resync { since_seq }`, replays buffered events oldest first, capped at 200
 
 Server rejects late approvals. If `expires_at` has passed, reply
@@ -341,7 +349,10 @@ download and then you walk away from it.*
 
 Your box is the GPU machine, so it is the Ollama host and the demo machine.
 
-1. `ollama pull qwen2.5-coder:14b-instruct-q4_K_M` (~9GB, start it immediately)
+1. `ollama pull qwen2.5:14b` (~9GB, default tag is q4_K_M so VRAM sizing is
+   unchanged; start it immediately). Not the `-coder` variant: codegen belongs to
+   the Claude escalation tier, the local model's job is narration and structured
+   JSON.
 2. Confirm it fits fully in VRAM: `ollama ps` should show 100% GPU. If it shows
    any CPU split, say so, we drop to Mistral Nemo 12B.
 3. Set `OLLAMA_HOST=0.0.0.0:11434` and restart Ollama so the backend can reach it
@@ -388,6 +399,12 @@ python stub_server.py --port 8765 --rate 6 --scenario scripted
 - OkHttp ping interval 20 to 30s, exponential backoff reconnect.
 - Battery optimization disabled on the demo device.
 - Biometric gate on Take Action is **not a stretch goal**, the demo depends on it.
+
+The `diagnose(event_id)` capability the app wants already exists: it is
+`escalation.verdict` in Contract 1, produced by the Claude escalation tier when
+`escalation.state` is `answered`. It arrives either on the event itself or as a
+later re-emit of the same `event_id` with a fresh `seq`. Render that field
+rather than waiting for a new endpoint.
 
 Cut QR pairing first if you run out of time. Hardcode the token or use a typed
 PIN. It costs real hours and adds nothing to the score.
@@ -474,3 +491,47 @@ Bump `v` only on a breaking change. Adding an optional field is not breaking,
 provided the phone ignores unknown keys. `contract.json` generated from
 `schemas.py` is the machine-readable form of contracts 1 and 3 and is the input
 to Kotlin data class generation.
+
+---
+
+## DEPLOYMENT AND INFRASTRUCTURE
+
+Supersedes MACHINES above.
+
+### Who has what
+
+The Android owner is Shan's roommate. All hardware is his and lives in their
+shared apartment on one LAN.
+
+| Machine | Runs | At the venue? |
+|---|---|---|
+| Homelab "serverpi", Tailscale `100.110.30.122` | the Sentinel backend | no |
+| His PC (RTX 4070 Super) | Ollama | no |
+| His Samsung S26 | the Android app; the demo device | yes |
+| Shan's laptop | development, and remote restart at the venue | yes |
+
+### Tailscale
+
+Only one hop crosses the internet: phone to serverpi. serverpi and the PC are
+on the same LAN, so Ollama is reached at its LAN address rather than over
+Tailscale. Tailnet nodes: serverpi, the Samsung, Shan's laptop.
+
+### Two things that break if forgotten
+
+- The self-signed cert needs serverpi's Tailscale hostname or IP in its SAN.
+  The app pins the cert, so one generated only for the LAN address is rejected
+  once the phone connects from the venue.
+- Ollama `keep_alive` must be long so the model does not unload while the
+  machines sit idle before the demo.
+
+### Secrets
+
+- `ANTHROPIC_API_KEY` set on serverpi.
+- `OLLAMA_BASE_URL` on serverpi points at the PC's LAN address.
+
+### Venue plan
+
+Bring a laptop on the tailnet so a dead backend is restarted over SSH rather
+than watched. Pre-flight is the app's connection indicator: green plus
+`ollama: ok` means everything upstream is alive. Film the submission video at
+the apartment, on one LAN, before anything depends on venue wifi.

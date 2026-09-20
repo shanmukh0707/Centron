@@ -1,10 +1,16 @@
 # SENTINEL — LOCAL MODEL PROMPT
 
-System prompt, input envelope and few-shot examples for Qwen2.5-Coder-14B via
+System prompt, input envelope and few-shot examples for `qwen2.5:14b` via
 Ollama. Written against `schemas.py` as built, so the parameter keys below are
 the real ones.
 
-Suggested location: `backend/prompts/`.
+`llm.py` parses this file at startup: the system prompt from section 3, the
+few-shot turns from the fenced JSON blocks in section 4, and the retry template
+from section 5. Edit here, not in Python.
+
+Model choice: `qwen2.5:14b`, not the `-coder` variant. Codegen belongs to the
+Claude escalation tier; the local model's job is narration and structured JSON.
+The default tag is q4_K_M so VRAM sizing is unchanged.
 
 ---
 
@@ -12,7 +18,7 @@ Suggested location: `backend/prompts/`.
 
 ```python
 {
-  "model": "qwen2.5-coder:14b-instruct-q4_K_M",
+  "model": "qwen2.5:14b",
   "format": "json",
   "stream": False,
   "keep_alive": "30m",
