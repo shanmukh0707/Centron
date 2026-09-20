@@ -101,6 +101,9 @@ import java.util.TimeZone
 class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Before the service starts, so it connects to the paired engine
+        // rather than the stub default.
+        AppSettings.attach(this)
         SentinelService.start(this)
         setContent {
             val mode by AppSettings.themeMode.collectAsState()

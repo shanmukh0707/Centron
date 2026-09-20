@@ -50,6 +50,9 @@ class SentinelService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // START_STICKY can restart this service without the activity, so the
+        // pairing has to load here too, not only in onCreate.
+        AppSettings.attach(this)
         val config = AppSettings.engineConfig.value
 
         createChannel()

@@ -6,6 +6,8 @@ import android.media.AudioManager
 import android.media.RingtoneManager
 import android.os.Build
 import android.os.CombinedVibration
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -62,6 +64,16 @@ class SpeechQueue(
     )
 
     private val tag = "SpeechQueue"
+
+    /**
+     * ExoPlayer is single-threaded: it must be built and driven from one
+     * Looper thread, and it throws if you touch it from anywhere else.
+     * Frames arrive on the socket's coroutine, so every player call hops
+     * here first. This is not tidiness — without it the first spoken event
+     * takes the app down with an IllegalStateException.
+     */
+    private val main = Handler(Looper.getMainLooper())
+
     private val queue = ArrayDeque<Utterance>()
     private val spoken = LinkedHashSet<String>()
     private var player: ExoPlayer? = null
@@ -114,8 +126,10 @@ class SpeechQueue(
     fun stop() {
         queue.clear()
         current = null
-        player?.release()
-        player = null
+        main.post {
+            player?.release()
+            player = null
+        }
     }
 
     // -------------------------------------------------------------- internals
@@ -135,22 +149,29 @@ class SpeechQueue(
 
         current = next
         remember(next.cacheKey)
+        main.post { start(next) }
+    }
 
-        val p = ensurePlayer() ?: run {
+    /** Runs on the main looper. Every ExoPlayer call in this class does. */
+    private fun start(utterance: Utterance) {
+        val p = ensurePlayer()
+        if (p == null) {
             Log.w(tag, "no player available; cannot speak")
-            current = null
+            synchronized(this) { current = null }
             return
         }
-
         try {
-            p.setMediaItem(MediaItem.fromUri(next.url))
+            p.setMediaItem(MediaItem.fromUri(utterance.url))
             p.prepare()
             p.play()
+            Log.i(tag, "speaking ${utterance.severity} ${utterance.eventId}")
         } catch (e: Exception) {
             // Never let a playback failure take down the stream.
-            Log.w(tag, "playback failed for ${next.eventId}: ${e.message}")
-            current = null
-            playNext()
+            Log.w(tag, "playback failed for ${utterance.eventId}: ${e.message}")
+            synchronized(this) {
+                current = null
+                playNext()
+            }
         }
     }
 
@@ -198,6 +219,9 @@ class SpeechQueue(
 
         return ExoPlayer.Builder(context)
             .setMediaSourceFactory(DefaultMediaSourceFactory(factory))
+            // Pin the player to the main looper rather than whichever thread
+            // happened to build it.
+            .setLooper(Looper.getMainLooper())
             .build()
             .apply {
                 setAudioAttributes(

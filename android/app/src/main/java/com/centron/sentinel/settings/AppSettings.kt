@@ -1,5 +1,7 @@
 package com.centron.sentinel.settings
 
+import android.content.Context
+import android.content.SharedPreferences
 import com.centron.sentinel.net.EngineConfig
 import com.centron.sentinel.ui.theme.ThemeMode
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -48,10 +50,53 @@ object AppSettings {
     private val _engineConfig = MutableStateFlow(EngineConfig.LOCAL_STUB)
     val engineConfig: StateFlow<EngineConfig> = _engineConfig.asStateFlow()
 
+    private var prefs: SharedPreferences? = null
+
+    /**
+     * Restore the pairing from disk.
+     *
+     * Without this the pairing lives only in process memory, so every app
+     * restart — including one Android does on its own to reclaim memory —
+     * silently drops the engine and lands the operator back on the pairing
+     * screen. Mid-demo that is indistinguishable from the engine being down.
+     *
+     * The token is a bearer secret sitting in app-private plaintext. That is
+     * weaker than the Keystore-wrapped blob this wants to be, and is the
+     * known gap to close after submission.
+     */
+    fun attach(context: Context) {
+        if (prefs != null) return
+        val p = context.applicationContext
+            .getSharedPreferences("centron.engine", Context.MODE_PRIVATE)
+        prefs = p
+
+        val host = p.getString(KEY_HOST, null) ?: return
+        _engineConfig.value = EngineConfig(
+            host = host,
+            port = p.getInt(KEY_PORT, 8765),
+            certSha256 = p.getString(KEY_PIN, "").orEmpty(),
+            token = p.getString(KEY_TOKEN, "").orEmpty(),
+            useTls = p.getBoolean(KEY_TLS, true),
+        )
+        _sites.value = listOf(Site(host, "serverpi", "$host:${p.getInt(KEY_PORT, 8765)}"))
+        _currentSiteId.value = host
+    }
+
+    private fun persist(config: EngineConfig) {
+        prefs?.edit()
+            ?.putString(KEY_HOST, config.host)
+            ?.putInt(KEY_PORT, config.port)
+            ?.putString(KEY_PIN, config.certSha256)
+            ?.putString(KEY_TOKEN, config.token)
+            ?.putBoolean(KEY_TLS, config.useTls)
+            ?.apply()
+    }
+
     /** Returns false if the code is malformed. */
     fun pair(code: String): Boolean {
         val parsed = EngineConfig.fromPairingCode(code) ?: return false
         _engineConfig.value = parsed
+        persist(parsed)
         _sites.value = listOf(
             Site(parsed.host, "serverpi", "${parsed.host}:${parsed.port}")
         ) + _sites.value.filterNot { it.id == parsed.host }
@@ -61,7 +106,16 @@ object AppSettings {
 
     fun useLocalStub() {
         _engineConfig.value = EngineConfig.LOCAL_STUB
+        // Clear rather than persist: a stored stub config would quietly win
+        // over a real pairing on the next launch.
+        prefs?.edit()?.clear()?.apply()
     }
+
+    private const val KEY_HOST = "host"
+    private const val KEY_PORT = "port"
+    private const val KEY_PIN = "pin"
+    private const val KEY_TOKEN = "token"
+    private const val KEY_TLS = "tls"
 
     private val _sites = MutableStateFlow(
         listOf(

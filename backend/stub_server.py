@@ -187,6 +187,16 @@ class Hub:
             return S.make_frame(type_, data, seq=self.seq)
         fr = self.frame(type_, data)
         await self.broadcast(fr)
+        # An event shipping pending audio owes the phone an audio_ready, or it
+        # is simply mute: the client holds a pending ref and waits forever.
+        # _emit_pipeline_event schedules its own render, but the scripted
+        # scenarios did not, so once a renderer was installed every scripted
+        # demo went silent. Enforcing it here means a new scenario cannot
+        # forget. render_audio is idempotent per cache_key.
+        if type_ == "event":
+            audio = getattr(data, "audio", None)
+            if audio is not None and audio.status == "pending":
+                self.render_audio(data.event_id, audio, data.tts_summary)
         return fr
 
     def later(self, delay_s: float, make_coro: Callable[[], Awaitable[Any]]) -> None:
@@ -817,11 +827,9 @@ async def _emit_pipeline_event(hub: Hub, ev: S.EventData, reemit: bool = False) 
     if hub.pipe is not None and not reemit:
         hub.pipe.db.update_event(ev.event_id, seq=fr.seq)
 
-    # Speech starts only after the event is on the wire. A re-emit carries the
-    # same phrase, so the cache answers it and no second render happens.
-    ref = with_audio.audio
-    if ref is not None and ref.status == "pending":
-        hub.render_audio(ev.event_id, ref, with_audio.tts_summary)
+    # The render used to be scheduled here. hub.emit now does it for every
+    # event carrying pending audio, so doing it again would render twice and
+    # send two audio_ready frames for one event.
 
 
 async def pipeline_loop(hub: Hub) -> None:
