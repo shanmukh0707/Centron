@@ -1,0 +1,72 @@
+# Sentinel engine, as a systemd service on serverpi.
+#
+# Installed by tools/deploy-serverpi.sh, which rewrites the paths and User
+# below. Do not edit the copy in /etc/systemd/system by hand — re-run the
+# deploy script so this file stays the source of truth.
+#
+# Why a service and not a tmux window: contracts.md's venue plan is "bring a
+# laptop on the tailnet so a dead backend is restarted over SSH rather than
+# watched". A unit that restarts itself is strictly better than a human
+# noticing, and it survives the reboot nobody planned.
+
+[Unit]
+Description=Sentinel engine (ambient voice SOC for the homelab)
+Documentation=file://__ROOT__/docs/contracts.md
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__ROOT__/backend
+
+# ANTHROPIC_API_KEY, OLLAMA_BASE_URL, SENTINEL_TOKEN.
+# 600, owned by __USER__. Never committed — backend/.env is gitignored.
+EnvironmentFile=__ROOT__/backend/.env
+
+# The shipped backend/protected_assets.yaml stays empty by design (there is a
+# test). The real list for this deployment lives in tools/.
+Environment=SENTINEL_ASSETS_FILE=__ROOT__/tools/protected_assets.serverpi.yaml
+
+# --source pipeline  real events, not scripted scenarios
+# --syslog           listen for forwarded logs (UDP+TCP 5514)
+# --live-ollama      the model on the PC, via OLLAMA_BASE_URL
+# --db               persist events and the redaction map across restarts
+# --certfile/keyfile wss://, which the app requires and pins
+#
+# Executor stays in dry run: --live is deliberately absent. Invariant 10.
+ExecStart=__ROOT__/backend/.venv/bin/python stub_server.py \
+    --source pipeline \
+    --syslog \
+    --live-ollama \
+    --db __ROOT__/backend/sentinel.db \
+    --certfile __ROOT__/backend/certs/cert.pem \
+    --keyfile __ROOT__/backend/certs/key.pem \
+    --host 0.0.0.0 \
+    --port 8765
+
+Restart=always
+RestartSec=5
+
+# A crash loop should be visible, not silent. If it restarts more than 5 times
+# in 2 minutes, stop and leave the failure on the unit for someone to find.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel
+
+# Modest hardening. Not a sandbox — the executor needs network reach for the
+# playbooks it will eventually run — but no reason to leave the obvious doors
+# open on a box that parses attacker-controlled text.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,57 @@
+# Protected assets for THIS deployment (serverpi).
+#
+# Selected at runtime with SENTINEL_ASSETS_FILE, which the systemd unit sets.
+# It lives here rather than in backend/protected_assets.yaml because
+# tests/test_assets_ingest.py asserts the shipped file stays empty — a
+# checked-in list would be one person's network applied to everyone else's.
+#
+# Sentinel already adds, at startup and unconditionally, every address bound to
+# serverpi plus the default gateway from the routing table. That floor cannot
+# be configured away. This file is what it cannot infer: the other machines
+# that must never be a target.
+#
+# Filled 2026-09-20 from `tailscale status` and the PC's own interfaces.
+# VERIFIED came from live output. ASSUMED needs confirming before --live.
+#
+# The whole tailnet (100.64.0.0/10) is deliberately NOT blanket-listed: that
+# would protect every future node automatically, including ones with no
+# business being trusted. Present nodes are listed individually.
+
+protected_assets:
+  # --- the engine's own machine -------------------------------------------
+  # Blocking serverpi removes your ability to un-block it. The startup floor
+  # covers the interfaces it can see; these are listed anyway so the Tailscale
+  # address is refused even if tailscaled is down when the process starts.
+  - 100.110.30.122        # serverpi, Tailscale            VERIFIED
+  - 192.168.1.8           # serverpi, LAN                  VERIFIED
+  - serverpi
+
+  # --- the model host ------------------------------------------------------
+  # Blocking the PC does not stop Sentinel, but it removes triage, so every
+  # subsequent event degrades to unreviewed.
+  - 192.168.1.7           # PC, LAN (OLLAMA_BASE_URL)      VERIFIED
+  - 100.112.187.20        # PC, Tailscale                  VERIFIED
+  - shamitsgamingpc
+
+  # --- the demo device -----------------------------------------------------
+  # The phone is how actions get approved. If an event can isolate the phone,
+  # one bad verdict locks you out of your own controls mid-demo.
+  - 100.88.198.41         # Samsung S26, Tailscale         VERIFIED
+  - shamits-s26-ultra
+
+  # --- the operator's laptop ----------------------------------------------
+  # contracts.md venue plan: this is how a dead backend is restarted over SSH.
+  # It has to stay reachable.
+  - 100.100.142.27        # laptop, Tailscale              VERIFIED
+  - shamits-laptop
+
+  # --- network infrastructure ---------------------------------------------
+  # Already added automatically from the routing table, so this is belt and
+  # braces. CONFIRM before --live: if the LAN is not 192.168.1.0/24 this line
+  # is wrong and, worse, misleading.
+  - 192.168.1.1           # gateway / router               ASSUMED
+  - gw01
+
+  # --- not present, add if they appear -------------------------------------
+  # - 192.168.1.10        # hypervisor / Proxmox host
+  # - 192.168.1.20        # NAS
