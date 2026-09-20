@@ -146,13 +146,24 @@ def test_event_fields_come_from_parser_facts_and_model_only_where_allowed():
     assert str(ev.action.params.target) == "203.0.113.7/32"
 
 
-def test_internal_log_is_relocalized_for_names_but_never_carries_ip_literals():
+def test_internal_log_is_fully_relocalized_with_real_values():
     ev = next(e for e in run_fixture() if e.signature == "ssh.auth.success")
     assert "alice" in ev.internal_log
     assert "bastion" in ev.internal_log
+    assert "10.0.0.42" in ev.internal_log
+    assert not TOKEN_RE.search(ev.internal_log)
+
+
+def test_no_emitted_internal_log_carries_a_token():
+    for ev in run_fixture():
+        assert not TOKEN_RE.search(ev.internal_log), ev.internal_log
+
+
+def test_injected_free_text_username_is_neutralised_in_internal_log():
+    ev = next(e for e in run_fixture() if e.source.raw_count == 12)
+    assert INJECTION not in ev.internal_log
     assert "USER_" not in ev.internal_log
-    assert "10.0.0.42" not in ev.internal_log  # contract forbids literals in prose
-    assert [str(ip) for ip in ev.entities.src_ips] == ["10.0.0.42"]
+    assert "malformed username" in ev.internal_log
 
 
 def test_action_params_are_resolved_to_real_values():

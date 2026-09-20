@@ -8,7 +8,7 @@
     "signature": "ssh.bruteforce",
     "severity": "high",
     "title": "SSH brute force against bastion",
-    "internal_log": "HOST_A attempted 47 SSH logins as USER_1 and USER_2 against bastion in 60s; all failed. Pattern matches ssh.bruteforce. Recommending block_ip on HOST_A.",
+    "internal_log": "185.220.101.34 attempted 47 SSH logins as svc-backup and root against bastion in 60s; all failed. Pattern matches ssh.bruteforce. Recommending block_ip on 185.220.101.34.",
     "tts_summary": "Repeated failed SSH logins from one outside address are waiting for your approval to block.",
     "confidence": 0.91,
     "entities": {

@@ -514,7 +514,18 @@ def _literal_violations(text: str) -> list[str]:
 
 
 def validate_internal_log(text: str) -> list[str]:
+    """OllamaOutput side: the model only ever sees tokens, so no literal may appear."""
     return _literal_violations(text)
+
+
+# Redaction token shapes (mirrors redaction.py). EventData is post-localization:
+# the phone gets real values, so a leftover token means localize() was skipped.
+_TOKEN_RE = re.compile(r"\b(?:HOST_[A-Z]+|USER_\d+|MAC_\d+)\b")
+
+
+def validate_no_tokens(text: str) -> list[str]:
+    """EventData side: every redaction token must have been localized away."""
+    return [f"contains unlocalized token {tok!r}" for tok in sorted(set(_TOKEN_RE.findall(text)))]
 
 
 def validate_tts(summary: str, tokens: Iterable[str] = ()) -> list[str]:
@@ -551,6 +562,13 @@ def _tts_field(v: str, info: ValidationInfo | None) -> str:
 
 def _internal_log_field(v: str) -> str:
     problems = validate_internal_log(v)
+    if problems:
+        raise ValueError("internal_log: " + "; ".join(problems))
+    return v
+
+
+def _localized_log_field(v: str) -> str:
+    problems = validate_no_tokens(v)
     if problems:
         raise ValueError("internal_log: " + "; ".join(problems))
     return v
@@ -725,7 +743,7 @@ class EventData(Strict):
     @field_validator("internal_log")
     @classmethod
     def _log(cls, v: str) -> str:
-        return _internal_log_field(v)
+        return _localized_log_field(v)
 
 
 # --------------------------------------------------------------------------- #
@@ -979,8 +997,8 @@ def build_samples() -> dict[str, _Frame]:
         severity="high",
         title="SSH brute force against bastion",
         internal_log=(
-            "HOST_A attempted 47 SSH logins as USER_1 and USER_2 against bastion in 60s; "
-            "all failed. Pattern matches ssh.bruteforce. Recommending block_ip on HOST_A."
+            "185.220.101.34 attempted 47 SSH logins as svc-backup and root against bastion in 60s; "
+            "all failed. Pattern matches ssh.bruteforce. Recommending block_ip on 185.220.101.34."
         ),
         tts_summary="Repeated failed SSH logins from one outside address are waiting for your approval to block.",
         confidence=0.91,

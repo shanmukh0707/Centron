@@ -8,9 +8,10 @@ Provenance rules (enforced here, not trusted to the model):
                         escalate, escalate_reason, action, action_params.
   * The model only ever sees a redacted ModelInput. A leak check runs on the
     prompt before every call and raises instead of sending.
-  * internal_log is re-localized with RedactionMap.localize_safe(): names come
-    back, IP/MAC literals stay tokens because schemas.validate_internal_log
-    forbids them in prose (real IPs travel in entities.src_ips).
+  * internal_log is re-localized with RedactionMap.localize() so the phone
+    gets real values; EventData rejects any leftover token. A token whose value
+    is not identifier-shaped (an injected "username" with spaces) is replaced
+    with a fixed marker first, so attacker free text never rides along.
   * tts_summary must pass validate_tts: one retry, then a deterministic
     template from (signature, severity). The event is never dropped.
   * action_params tokens are resolved locally and run through
@@ -37,7 +38,7 @@ from aggregator import AggregatedEvent, Aggregator
 from llm import ModelInput, OllamaClient
 from log_source import replay_fixture, tail_file
 from parsers import SIGNATURE_META, LineParser, SignatureMeta
-from redaction import TOKEN_RE, RedactionMap
+from redaction import IDENTIFIER_RE, TOKEN_RE, RedactionMap
 from schemas import (
     ActionRef,
     Entities,
@@ -51,7 +52,6 @@ from schemas import (
     now_utc,
     uuid7,
     validate_and_classify,
-    validate_internal_log,
     validate_tts,
 )
 
@@ -60,6 +60,7 @@ _HOST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 CONFIDENCE_FLOOR = 0.7
 APPROVAL_TTL_SEC = 600
 _UNKNOWN_META = SignatureMeta("unknown", "unknown", "Unrecognised activity")
+FREE_TEXT_MARKER = "[malformed username]"
 
 
 class LLM(Protocol):
@@ -145,9 +146,7 @@ class Pipeline:
         mi = self._model_input(agg)
         out, tts = self._ask_model(mi, agg)
 
-        internal_log = self.rmap.localize_safe(out.internal_log)
-        if validate_internal_log(internal_log):  # belt and braces; localize_safe should never do this
-            internal_log = out.internal_log
+        internal_log = self.rmap.localize(self._neutralise_free_text(out.internal_log))
 
         action, rejection = self._action(out)
         if rejection:
@@ -204,6 +203,15 @@ class Pipeline:
         for tok in (*mi.src_tokens, *mi.dst_tokens, *mi.user_tokens):
             if not TOKEN_RE.fullmatch(tok):
                 raise LeakError(f"entity is not a token: {tok!r}")
+
+    def _neutralise_free_text(self, text: str) -> str:
+        """Swap tokens whose real value is not identifier-shaped for a marker."""
+        def repl(m: re.Match[str]) -> str:
+            value = self.rmap.value_for(m.group(0))
+            if value is None or IDENTIFIER_RE.match(value):
+                return m.group(0)
+            return FREE_TEXT_MARKER
+        return TOKEN_RE.sub(repl, text)
 
     # --------------------------------------------------------------- model
     def _ask_model(self, mi: ModelInput, agg: AggregatedEvent) -> tuple[OllamaOutput, str]:

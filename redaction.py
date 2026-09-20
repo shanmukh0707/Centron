@@ -18,13 +18,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from schemas import validate_internal_log
-
 TOKEN_RE = re.compile(r"\b(?:HOST_[A-Z]+|USER_\d+|MAC_\d+)\b")
-# Shape a value must have to be restored into prose by localize_safe(): the
-# union of schemas.HostId / UserId. Anything else (spaces, quotes, injected
-# sentences) stays a token in every human-facing field.
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._@:-]{1,128}$")
+# Union of schemas.HostId / UserId shapes. Values that do not fit (spaces,
+# quotes, injected sentences) are still tokenized, but the pipeline refuses to
+# restore them into human-facing prose.
+IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._@:-]{1,128}$")
 
 _MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
 # Full 8-group form, or a compressed form containing "::" with at least one hex
@@ -135,26 +133,6 @@ class RedactionMap:
         return text
 
     # -------------------------------------------------------------- localize
-    def _localize(self, text: str, allow) -> str:
-        def repl(m: re.Match[str]) -> str:
-            value = self._token_to_value.get(m.group(0))
-            if value is None or not allow(value):
-                return m.group(0)
-            return value
-
-        return TOKEN_RE.sub(repl, text)
-
     def localize(self, text: str) -> str:
-        """Exact inverse of redact()."""
-        return self._localize(text, lambda _v: True)
-
-    def localize_safe(self, text: str) -> str:
-        """Restore only values the wire contract allows in prose fields.
-
-        schemas.validate_internal_log rejects IPv4/IPv6/MAC literals, so those
-        stay tokenized. Identifier-shaped hostnames and usernames are restored;
-        free-text values (e.g. an injected "username" with spaces) are not.
-        """
-        return self._localize(
-            text, lambda v: bool(_IDENTIFIER_RE.match(v)) and not validate_internal_log(v)
-        )
+        """Exact inverse of redact(). Unknown token-shaped words are left alone."""
+        return TOKEN_RE.sub(lambda m: self._token_to_value.get(m.group(0), m.group(0)), text)
