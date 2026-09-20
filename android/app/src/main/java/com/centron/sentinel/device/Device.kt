@@ -65,6 +65,22 @@ enum class DeviceType(
 enum class DeviceState { ONLINE, DEGRADED, OFFLINE, UNKNOWN }
 
 /**
+ * A single readable statistic.
+ *
+ * Separate from [Capability] on purpose: a capability is what the engine can
+ * do with a box, a StatKind is what the operator wants on screen. A Pi that
+ * reports thermals is not a Pi whose owner wants a temperature graph.
+ */
+enum class StatKind(val label: String, val unit: String, val graphable: Boolean) {
+    CPU("CPU", "%", true),
+    MEMORY("Memory", "%", true),
+    DISK("Disk", "%", true),
+    TEMPERATURE("Temperature", "°C", true),
+    /** A counter, not a series. Graphing it would draw a straight line. */
+    UPTIME("Uptime", "", false),
+}
+
+/**
  * Live telemetry. All nullable — a device that cannot report thermals is not
  * a device reporting 0°C, and a dashboard that cannot tell those apart lies.
  */
@@ -110,6 +126,28 @@ data class Device(
     val telemetry: Telemetry = Telemetry(),
     val powerOn: Boolean = true,
     val containers: List<Container> = emptyList(),
+    /** Which stats this device shows. Operator's choice, per device. */
+    val visibleStats: Set<StatKind> = StatKind.entries.toSet(),
+    /**
+     * Hides the power control entirely.
+     *
+     * For the box you cannot afford to lose — the one the engine runs on, or
+     * anything you would have to walk to in order to bring back. Removing the
+     * button is a stronger guarantee than trusting yourself not to press it.
+     */
+    val powerControlsEnabled: Boolean = true,
+    /**
+     * Require a fresh unlock before a power change reaches the engine.
+     *
+     * Defaults on. Off is a deliberate choice for a box where an accidental
+     * press costs nothing, and the sheet says so before it lets you.
+     */
+    val powerRequiresBiometric: Boolean = true,
 ) {
     fun can(capability: Capability): Boolean = capability in capabilities
+
+    /** Capability and operator preference both have to agree. */
+    fun showsPower(): Boolean = can(Capability.POWER) && powerControlsEnabled
+
+    fun shows(stat: StatKind): Boolean = stat in visibleStats
 }

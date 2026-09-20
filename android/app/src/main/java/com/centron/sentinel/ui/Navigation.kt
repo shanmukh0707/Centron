@@ -18,6 +18,7 @@ sealed interface Route {
     data object AddDevice : Route
     data object Settings : Route
     data class DeviceDetail(val deviceId: String) : Route
+    data class DeviceSettings(val deviceId: String) : Route
     data class Chat(val scope: ChatScope) : Route
     data class Approval(val eventId: String) : Route
 }

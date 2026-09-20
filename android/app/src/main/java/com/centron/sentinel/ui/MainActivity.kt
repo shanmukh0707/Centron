@@ -56,7 +56,9 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.centron.sentinel.contract.Decision
 import com.centron.sentinel.data.EventEntity
+import com.centron.sentinel.device.Device
 import com.centron.sentinel.device.DeviceRegistry
+import com.centron.sentinel.device.TelemetryHistory
 import com.centron.sentinel.engine.ChatScope
 import com.centron.sentinel.engine.ChatTurn
 import com.centron.sentinel.engine.EngineResult
@@ -76,6 +78,7 @@ import com.centron.sentinel.ui.chat.ChatController
 import com.centron.sentinel.ui.chat.ChatScreen
 import com.centron.sentinel.ui.home.AddDeviceScreen
 import com.centron.sentinel.ui.home.DeviceDetailScreen
+import com.centron.sentinel.ui.home.DeviceSettingsSheet
 import com.centron.sentinel.ui.home.HomeScreen
 import com.centron.sentinel.ui.pairing.PairingScreen
 import com.centron.sentinel.ui.settings.SettingsScreen
@@ -180,6 +183,7 @@ private fun Shell(
     val connection by vm.connection.collectAsState()
     val events by vm.events.collectAsState()
     val devices by DeviceRegistry.devices.collectAsState()
+    val telemetryHistory by DeviceRegistry.history.collectAsState()
     val alerts by AlertCenter.alerts.collectAsState()
     val unread by AlertCenter.unread.collectAsState()
     val autoOpen by AlertCenter.autoOpen.collectAsState()
@@ -297,10 +301,11 @@ private fun Shell(
             }
             DeviceDetailScreen(
                 device = device,
+                history = telemetryHistory[device.id] ?: TelemetryHistory(),
                 onBack = { onRoute(Route.Home) },
+                onOpenSettings = { onRoute(Route.DeviceSettings(device.id)) },
                 onTogglePower = { on ->
-                    DeviceRegistry.setPower(device.id, on)
-                    notice = if (on) "${device.name} power on requested." else "${device.name} power off requested."
+                    scope.launch { notice = changePower(activity, device, on) }
                 },
                 onToggleContainer = { container, run ->
                     DeviceRegistry.setContainerRunning(device.id, container.name, run)
@@ -315,6 +320,37 @@ private fun Shell(
                             ChatScope.ContainerScope(device.id, device.name, container.name)
                         )
                     )
+                },
+            )
+            return
+        }
+
+        is Route.DeviceSettings -> {
+            val device = devices.firstOrNull { it.id == route.deviceId }
+            if (device == null) {
+                onRoute(Route.Home)
+                return
+            }
+            DeviceSettingsSheet(
+                device = device,
+                onDismiss = { onRoute(Route.DeviceDetail(device.id)) },
+                onSave = { name, host, role, stats, powerEnabled, powerBiometric ->
+                    DeviceRegistry.updateSettings(
+                        id = device.id,
+                        name = name,
+                        host = host,
+                        role = role,
+                        visibleStats = stats,
+                        powerControlsEnabled = powerEnabled,
+                        powerRequiresBiometric = powerBiometric,
+                    )
+                    notice = "${name.trim().ifBlank { device.name }} updated."
+                    onRoute(Route.DeviceDetail(device.id))
+                },
+                onForget = {
+                    DeviceRegistry.remove(device.id)
+                    notice = "${device.name} removed from this phone."
+                    onRoute(Route.Home)
                 },
             )
             return
@@ -469,8 +505,7 @@ private fun Shell(
                 },
                 onOpenDevice = { onRoute(Route.DeviceDetail(it.id)) },
                 onTogglePower = { device, on ->
-                    DeviceRegistry.setPower(device.id, on)
-                    notice = if (on) "${device.name} power on requested." else "${device.name} power off requested."
+                    scope.launch { notice = changePower(activity, device, on) }
                 },
                 onOpenChat = { onRoute(Route.Chat(ChatScope.Fleet)) },
             )
@@ -571,6 +606,64 @@ private suspend fun approve(
             "${verb}d — unlocked, unsigned on this OS version."
         }
         BiometricGate.Result.Cancelled -> "Cancelled. Nothing sent."
+        is BiometricGate.Result.Unavailable -> result.reason
+        is BiometricGate.Result.Failed -> "Authentication failed: ${result.reason}"
+    }
+}
+
+/**
+ * Runs the gate, then changes device power.
+ *
+ * Same order as [approve], for the same reason: authenticate first, act
+ * second. Powering off the box the engine runs on is the one action in this
+ * app you cannot undo from this app — the thing you would use to turn it back
+ * on went down with it — so it is gated by default.
+ *
+ * Wake is gated too. It is the lesser risk, but a single toggle that means
+ * "prompt in one direction and not the other" is a control people misread, and
+ * the cost of being wrong is a machine booting in an empty house.
+ */
+private suspend fun changePower(
+    activity: FragmentActivity,
+    device: Device,
+    on: Boolean,
+): String {
+    if (!device.showsPower()) {
+        return "Power controls are switched off for ${device.name}."
+    }
+
+    val verb = if (on) "Power on" else "Power off"
+
+    // The per-device setting can waive the prompt; the global strict setting
+    // cannot be waived by it. Strict means strict.
+    val gated = device.powerRequiresBiometric || AppSettings.strictApproval.value
+    if (!gated) {
+        DeviceRegistry.setPower(device.id, on)
+        return "${device.name}: ${verb.lowercase()} requested."
+    }
+
+    val payload = BiometricGate.powerPayloadFor(
+        deviceId = device.id,
+        host = device.host,
+        action = if (on) "power_on" else "power_off",
+        clientTs = nowIso(),
+    )
+
+    return when (val result = BiometricGate.authorize(
+        activity = activity,
+        title = "$verb ${device.name}",
+        subtitle = if (on) device.host else "${device.host} goes off the network",
+        payload = payload,
+    )) {
+        is BiometricGate.Result.Signed -> {
+            DeviceRegistry.setPower(device.id, on)
+            "${device.name}: ${verb.lowercase()} requested — signed on device."
+        }
+        BiometricGate.Result.AuthenticatedUnsigned -> {
+            DeviceRegistry.setPower(device.id, on)
+            "${device.name}: ${verb.lowercase()} requested — unlocked, unsigned on this OS version."
+        }
+        BiometricGate.Result.Cancelled -> "Cancelled. ${device.name} untouched."
         is BiometricGate.Result.Unavailable -> result.reason
         is BiometricGate.Result.Failed -> "Authentication failed: ${result.reason}"
     }

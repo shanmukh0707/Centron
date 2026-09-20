@@ -1,5 +1,6 @@
 package com.centron.sentinel.ui.home
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,12 +25,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import com.centron.sentinel.device.Capability
 import com.centron.sentinel.device.Container
 import com.centron.sentinel.device.Device
 import com.centron.sentinel.device.DeviceState
+import com.centron.sentinel.device.StatKind
+import com.centron.sentinel.device.Telemetry
+import com.centron.sentinel.device.TelemetryHistory
 import com.centron.sentinel.ui.theme.Accent
 import com.centron.sentinel.ui.theme.Ink
 import com.centron.sentinel.ui.theme.MonoSmall
@@ -46,7 +52,9 @@ import com.centron.sentinel.ui.theme.Status
 @Composable
 fun DeviceDetailScreen(
     device: Device,
+    history: TelemetryHistory,
     onBack: () -> Unit,
+    onOpenSettings: () -> Unit,
     onTogglePower: (Boolean) -> Unit,
     onToggleContainer: (Container, Boolean) -> Unit,
     onAskAboutDevice: () -> Unit,
@@ -81,6 +89,8 @@ fun DeviceDetailScreen(
             )
             Spacer(Modifier.weight(1f))
             Text(device.type.label, style = MonoSmall, color = Ink.Tertiary)
+            Spacer(Modifier.width(Space.Sm))
+            GearButton(onOpenSettings)
         }
         Box(Modifier.fillMaxWidth().height(Space.Hair).background(Ink.Hairline))
 
@@ -119,7 +129,7 @@ fun DeviceDetailScreen(
             item { AskRow("Ask Centron about ${device.name}", onAskAboutDevice) }
 
             if (device.can(Capability.SYSTEM_USAGE) || device.can(Capability.THERMALS)) {
-                item { TelemetryPanel(device) }
+                item { TelemetryPanel(device, history) }
             }
 
             if (device.can(Capability.CONTAINERS)) {
@@ -145,10 +155,15 @@ fun DeviceDetailScreen(
                 }
             }
 
-            if (device.can(Capability.POWER)) {
+            if (device.showsPower()) {
                 item {
                     Spacer(Modifier.height(Space.Md))
-                    PowerPanel(device.powerOn, device.name, onTogglePower)
+                    PowerPanel(
+                        on = device.powerOn,
+                        name = device.name,
+                        gated = device.powerRequiresBiometric,
+                        onToggle = onTogglePower,
+                    )
                 }
             }
         }
@@ -173,9 +188,51 @@ private fun AskRow(label: String, onClick: () -> Unit) {
     }
 }
 
+/** A small gear. Drawn rather than pulled from material-icons-extended, which
+ *  is a multi-megabyte dependency for one glyph. */
 @Composable
-private fun TelemetryPanel(device: Device) {
+private fun GearButton(onClick: () -> Unit) {
+    // Palette lookups are composable reads and DrawScope is not composable,
+    // so the colour has to be resolved out here.
+    val gearTint = Ink.Secondary
+    Box(
+        Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .padding(Space.Sm),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(20.dp)) {
+            val c = Offset(size.width / 2f, size.height / 2f)
+            val outer = size.minDimension / 2f
+            // Short, thick teeth on a wide ring. Long thin spokes on a small
+            // circle draw a sun, which is what the first attempt looked like.
+            drawCircle(color = gearTint, radius = outer * 0.60f, center = c, style = Stroke(width = 3f))
+            repeat(8) { i ->
+                val angle = (i * 45.0) * Math.PI / 180.0
+                val dx = kotlin.math.cos(angle).toFloat()
+                val dy = kotlin.math.sin(angle).toFloat()
+                drawLine(
+                    color = gearTint,
+                    start = Offset(c.x + dx * outer * 0.66f, c.y + dy * outer * 0.66f),
+                    end = Offset(c.x + dx * outer * 0.98f, c.y + dy * outer * 0.98f),
+                    strokeWidth = 4f,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TelemetryPanel(device: Device, history: TelemetryHistory) {
     val t = device.telemetry
+    val graphs = StatKind.entries.filter { it.graphable && device.shows(it) }
+    val showUptime = device.shows(StatKind.UPTIME)
+
+    // Every stat switched off is a legitimate configuration, and an empty
+    // bordered box would just look broken.
+    if (graphs.isEmpty() && !showUptime) return
+
     Column(
         Modifier
             .fillMaxWidth()
@@ -186,12 +243,29 @@ private fun TelemetryPanel(device: Device) {
     ) {
         Text("SYSTEM", style = MaterialTheme.typography.labelSmall, color = Ink.Tertiary)
         Spacer(Modifier.height(Space.Md))
-        Stat("CPU", t.cpuPercent?.let { "$it%" })
-        Stat("Memory", t.memPercent?.let { "$it%" })
-        Stat("Disk", t.diskPercent?.let { "$it%" })
-        Stat("Temperature", t.tempC?.let { "${it.toInt()}°C" })
-        Stat("Uptime", t.uptimeSeconds?.let { formatUptime(it) })
+
+        graphs.forEachIndexed { index, stat ->
+            if (index > 0) Spacer(Modifier.height(Space.Lg))
+            StatGraph(
+                stat = stat,
+                series = history.series(stat),
+                current = currentValue(stat, t),
+            )
+        }
+
+        if (showUptime) {
+            Spacer(Modifier.height(Space.Md))
+            Stat("Uptime", t.uptimeSeconds?.let { formatUptime(it) })
+        }
     }
+}
+
+private fun currentValue(stat: StatKind, t: Telemetry): String? = when (stat) {
+    StatKind.CPU -> t.cpuPercent?.let { "$it%" }
+    StatKind.MEMORY -> t.memPercent?.let { "$it%" }
+    StatKind.DISK -> t.diskPercent?.let { "$it%" }
+    StatKind.TEMPERATURE -> t.tempC?.let { "${it.toInt()}°C" }
+    StatKind.UPTIME -> t.uptimeSeconds?.let { formatUptime(it) }
 }
 
 @Composable
@@ -295,7 +369,7 @@ private fun SmallToggle(on: Boolean, onChange: (Boolean) -> Unit) {
 }
 
 @Composable
-private fun PowerPanel(on: Boolean, name: String, onToggle: (Boolean) -> Unit) {
+private fun PowerPanel(on: Boolean, name: String, gated: Boolean, onToggle: (Boolean) -> Unit) {
     Column(
         Modifier
             .fillMaxWidth()
@@ -314,6 +388,16 @@ private fun PowerPanel(on: Boolean, name: String, onToggle: (Boolean) -> Unit) {
             },
             style = MaterialTheme.typography.bodyMedium,
             color = Ink.Secondary,
+        )
+        Spacer(Modifier.height(Space.Sm))
+        Text(
+            if (gated) {
+                "Requires your fingerprint."
+            } else {
+                "Not gated — this takes effect on the first tap."
+            },
+            style = MonoSmall,
+            color = if (gated) Ink.Tertiary else Status.Bad,
         )
         Spacer(Modifier.height(Space.Md))
         Box(

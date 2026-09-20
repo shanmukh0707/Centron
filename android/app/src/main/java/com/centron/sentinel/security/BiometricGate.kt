@@ -214,4 +214,14 @@ object BiometricGate {
     /** Binds the decision so a signature cannot be replayed onto another action. */
     fun payloadFor(approvalId: String, eventId: String, decision: String, clientTs: String): String =
         "$approvalId|$eventId|$decision|$clientTs"
+
+    /**
+     * Binds a device power change.
+     *
+     * The host is in the payload as well as the id, so a signature taken for
+     * one box cannot be replayed against another that happens to have been
+     * given the same local id by a later edit.
+     */
+    fun powerPayloadFor(deviceId: String, host: String, action: String, clientTs: String): String =
+        "power|$deviceId|$host|$action|$clientTs"
 }
