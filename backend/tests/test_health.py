@@ -258,6 +258,15 @@ def test_heartbeat_makes_no_network_calls(monkeypatch):
     assert stub_server.heartbeat_data(hub).pipeline.tts == "degraded"
 
 
+def test_debug_state_never_shows_the_defaults_before_the_first_heartbeat():
+    """/debug/state is what preflight prints. Before the first 10s tick the Hub
+    used to hold PipelineStatus() = all ok, which is exactly the lie."""
+    hub = stub_server.Hub(cfg=stub_server.Config())
+    hub.pipe = build()  # no escalator, no renderer
+    block = hub.snapshot()["pipeline"]
+    assert block["claude"] == "unreachable" and block["tts"] == "unreachable"
+
+
 def test_pipeline_health_is_shared_with_escalator():
     pipe = build(claude=FakeClaude())
     assert pipe.escalator.health is pipe.health

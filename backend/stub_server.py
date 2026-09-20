@@ -329,7 +329,22 @@ class Hub:
         self.pending[p.approval_id] = p
         return p
 
+    def refresh_pipeline(self) -> S.PipelineStatus:
+        """Cached SubsystemHealth only. This path never probes anything: a
+        heartbeat that blocks on a dead Ollama box would stop the heartbeat,
+        which is the one thing that has to keep going when everything else is
+        down. Called on every heartbeat and every /debug/state, so there is no
+        window at startup where the defaults (all ok) are on show."""
+        if self.pipe is not None:
+            self.pipeline = self.pipe.status()
+        else:
+            # Scripted source: the other three subsystems are stage props (and
+            # /debug/degrade may be driving them); tts is real either way.
+            self.pipeline = self.pipeline.model_copy(update={"tts": self.health.tts_state()})
+        return self.pipeline
+
     def snapshot(self) -> dict[str, Any]:
+        self.refresh_pipeline()
         return {
             "server_id": self.cfg.server_id,
             "seq": self.seq,
@@ -741,15 +756,7 @@ async def heartbeat_loop(hub: Hub) -> None:
 
 
 def heartbeat_data(hub: Hub) -> S.HeartbeatData:
-    """Cached SubsystemHealth only. This path never probes anything: a
-    heartbeat that blocks on a dead Ollama box would stop the heartbeat, which
-    is the one thing that has to keep going when everything else is down."""
-    if hub.pipe is not None:
-        hub.pipeline = hub.pipe.status()
-    else:
-        # Scripted source: the other three subsystems are stage props (and
-        # /debug/degrade may be driving them); tts is real either way.
-        hub.pipeline = hub.pipeline.model_copy(update={"tts": hub.health.tts_state()})
+    hub.refresh_pipeline()
 
     return S.HeartbeatData(
         interval_s=HEARTBEAT_S,

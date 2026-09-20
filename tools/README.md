@@ -99,12 +99,28 @@ sudo systemctl restart sentinel
    gateway is marked `ASSUMED`. Confirm it before `--live` is ever used.
 2. **Ollama `keep_alive`** on the PC, high, so the model does not unload while
    the machines idle before the demo.
-3. **Log forwarding.** Sources need to point rsyslog at serverpi:5514:
-   ```
-   *.*  @@100.110.30.122:5514
-   ```
-   Loopback is excluded by default — rsyslog forwarding to `127.0.0.1:5514` on
-   the same box is a feedback loop. `--syslog-allow-local` overrides it for dev.
+3. **Log forwarding.** See *Adding a machine* below. Loopback is excluded by
+   default — rsyslog forwarding to `127.0.0.1:5514` on the same box is a
+   feedback loop. `--syslog-allow-local` overrides it for dev.
+
+## Adding a machine
+
+On serverpi run `./tools/add-log-source.sh <that machine's LAN IP> <auth|firewall|dns>`; it registers the sender in `backend/source_map.yaml` and prints the one rsyslog line to paste on that machine (or copy `tools/rsyslog-client.conf` to its `/etc/rsyslog.d/`, then `systemctl restart rsyslog`).
+Forwarded lines only arrive when the unit runs `--syslog` instead of `--tail` (edit `tools/sentinel.service`, re-run the deploy script); the traditional-timestamp template in that line is mandatory, Debian 13's RFC 3339 default parses as nothing.
+
+## Before filming, before the stage
+
+```bash
+bash tools/preflight.sh
+```
+
+Nine PASS/FAIL lines in under ten seconds: service, websocket hello, keys in
+the *service's* environment, Ollama model loaded with its GPU/CPU split, a real
+audio render fetched and checked for silence, the last heartbeat's pipeline
+block verbatim, the database, the protected-assets file. Exit status is the
+number of failures. The audio check is also what proves the ElevenLabs
+renderer to the heartbeat: `tts` stays `degraded` until a render has actually
+succeeded.
 
 ## Local development, unchanged
 
