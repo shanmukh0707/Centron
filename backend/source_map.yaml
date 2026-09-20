@@ -1,0 +1,16 @@
+# Sentinel syslog source map: which parser family each sender speaks.
+#
+# Keys are the sender's address as the listener sees it (the peer of the UDP
+# datagram or TCP connection, NOT the hostname inside the syslog line, which
+# is attacker-influenced text). Values are one of: auth, firewall, dns.
+#
+# Senders not listed here are still accepted: every parser family is tried.
+# Lines from Sentinel's own addresses are always dropped, regardless of this
+# file, to prevent a syslog feedback loop.
+#
+# Point the pipeline at a different file with --source-map.
+
+sources:
+  # 192.168.1.1: firewall      # the gateway forwards kernel/UFW/pf logs
+  # 192.168.1.30: auth         # a host forwarding /var/log/auth.log (sshd)
+  # 192.168.1.53: dns          # Pi-hole (pihole-FTL)

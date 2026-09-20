@@ -47,6 +47,10 @@ _USER_CTX_RE = re.compile(
 )
 
 
+class LeakError(RuntimeError):
+    """A real value was about to leave the box (to the model or to Claude). Refuse."""
+
+
 def _letters(n: int) -> str:
     """0 -> A, 25 -> Z, 26 -> AA ..."""
     out = ""
@@ -55,6 +59,14 @@ def _letters(n: int) -> str:
         n, rem = divmod(n - 1, 26)
         out = chr(ord("A") + rem) + out
     return out
+
+
+def _letters_to_int(s: str) -> int:
+    """Inverse of _letters: A -> 0, Z -> 25, AA -> 26 ..."""
+    n = 0
+    for ch in s:
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n - 1
 
 
 @dataclass
@@ -95,6 +107,34 @@ class RedactionMap:
 
     def tokens(self) -> set[str]:
         return set(self._token_to_value)
+
+    def known_values(self) -> set[str]:
+        return set(self._value_to_token)
+
+    def pairs(self) -> dict[str, str]:
+        """token -> value, for persistence."""
+        return dict(self._token_to_value)
+
+    def preload(self, pairs: dict[str, str]) -> None:
+        """Restore token->value pairs from persistence (db.load_redaction_map).
+
+        Counters are advanced past every restored token so a restarted
+        Sentinel never re-issues HOST_A for a different host.
+        """
+        for tok, value in pairs.items():
+            if not TOKEN_RE.fullmatch(tok) or tok in self._token_to_value:
+                continue
+            self._token_to_value[tok] = value
+            self._value_to_token[value] = tok
+            kind, _, tail = tok.partition("_")
+            if kind == "HOST":
+                n = _letters_to_int(tail) + 1
+                self._known_hosts.add(value)
+            else:
+                n = int(tail)
+                if kind == "USER":
+                    self._known_users.add(value)
+            self._counts[kind] = max(self._counts[kind], n)
 
     def token_for(self, value: str) -> str | None:
         return self._value_to_token.get(value)

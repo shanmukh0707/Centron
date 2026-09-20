@@ -63,11 +63,34 @@ def test_prompt_contains_only_what_it_was_given():
 
 
 def test_real_request_body_shape():
-    client = OllamaClient(base_url="http://127.0.0.1:11434", model="qwen2.5-coder:14b", keep_alive="30m")
-    body = json.loads(client.request_body("hello"))
+    client = OllamaClient(base_url="http://127.0.0.1:11434", model="qwen2.5:14b", keep_alive="30m")
+    messages = client.build_messages(mi("net.portscan"))
+    body = json.loads(client.request_body(messages))
     assert body["format"] == "json"
     assert body["keep_alive"] == "30m"
     assert body["stream"] is False
-    assert body["model"] == "qwen2.5-coder:14b"
-    assert body["prompt"] == "hello"
-    assert client.endpoint == "http://127.0.0.1:11434/api/generate"
+    assert body["model"] == "qwen2.5:14b"
+    assert client.endpoint == "http://127.0.0.1:11434/api/chat"
+    # section 1 of prompts/model-prompt.md, verbatim
+    assert body["options"] == {"temperature": 0.2, "top_p": 0.9, "num_predict": 400, "num_ctx": 4096}
+    # system, six few-shot pairs as prior turns, then the real event
+    assert messages[0]["role"] == "system"
+    assert [m["role"] for m in messages[1:-1]] == ["user", "assistant"] * 6
+    assert messages[-1]["role"] == "user"
+    assert json.loads(messages[-1]["content"])["signature"] == "net.portscan"
+
+
+def test_defaults_come_from_prompt_file():
+    client = OllamaClient()
+    assert client.model == "qwen2.5:14b"
+    assert client.keep_alive == "30m"
+    assert client.timeout_sec == 15.0
+
+
+def test_input_envelope_matches_section_2():
+    env = mi("ssh.auth.brute_force", sample_lines=["a", "b", "c", "d"], novel_signature=True).to_dict()
+    assert set(env) == {"signature", "raw_count", "window_sec", "sources", "targets", "users", "ports",
+                        "correlated", "novel_signature", "samples"}
+    assert env["window_sec"] == 30
+    assert env["samples"] == ["a", "b", "c"]  # capped at 3
+    assert env["novel_signature"] is True

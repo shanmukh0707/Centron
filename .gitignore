@@ -7,3 +7,6 @@ venv/
 *.sqlite3
 .env
 .pytest_cache/
+*.db-wal
+*.db-shm
+*.db-journal

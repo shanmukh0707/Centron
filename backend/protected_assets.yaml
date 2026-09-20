@@ -1,0 +1,24 @@
+# Sentinel protected assets. Nothing in this list can ever be the target of a
+# playbook, auto or approved. Addresses, CIDRs, or host ids as they appear in
+# the logs (the parser's dst_host / host_id, e.g. "gw01").
+#
+# On top of this list, Sentinel adds at startup every address bound to the
+# machine it runs on plus the default gateway from the routing table. That
+# floor cannot be configured away.
+#
+# The executor refuses to start in --live mode while this list is empty:
+# an unconfigured Sentinel must not be able to block the hypervisor.
+#
+# Override the path with SENTINEL_ASSETS_FILE; append entries with
+# SENTINEL_PROTECTED_ASSETS="10.0.0.5,nas01" (comma separated).
+
+protected_assets:
+  # - 192.168.1.1        # gateway / router (the LAN side of the ISP box)
+  # - 100.110.30.122     # serverpi Tailscale address (the Sentinel host itself)
+  # - 192.168.1.10       # hypervisor / Proxmox host
+  # - 192.168.1.20       # NAS
+  # - 192.168.1.50       # admin workstation (the PC that runs Ollama)
+  # - 192.168.1.60       # admin phone on the LAN
+  # - 100.64.0.0/10      # the whole tailnet, if every node is trusted
+  # - gw01               # host ids as they appear in logs
+  # - serverpi

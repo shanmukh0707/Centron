@@ -74,6 +74,11 @@ SIGNATURE_META: dict[str, SignatureMeta] = {
 }
 
 
+# Which parser family a syslog `proc` belongs to; used by ingest.py's source_map.
+PROC_KIND: dict[str, str] = {"sshd": "auth", "kernel": "firewall", "pihole-FTL": "dns"}
+KINDS = frozenset(PROC_KIND.values())
+
+
 class LineParser:
     """Stateful only for counters. `year` fills the syslog timestamp's gap."""
 
@@ -82,8 +87,9 @@ class LineParser:
         self.parsed = 0
         self.dropped = 0
 
-    def parse(self, line: str) -> ParsedLine | None:
-        result = self._parse(line.rstrip("\r\n"))
+    def parse(self, line: str, kind: str | None = None) -> ParsedLine | None:
+        """`kind` (auth | firewall | dns) restricts which family is tried; None tries all."""
+        result = self._parse(line.rstrip("\r\n"), kind)
         if result is None:
             self.dropped += 1
         else:
@@ -96,7 +102,7 @@ class LineParser:
             if p is not None:
                 yield p
 
-    def _parse(self, line: str) -> ParsedLine | None:
+    def _parse(self, line: str, kind: str | None = None) -> ParsedLine | None:
         head = _SYSLOG_RE.match(line)
         if head is None:
             return None
@@ -108,6 +114,8 @@ class LineParser:
         except (KeyError, ValueError):
             return None
         host, proc, msg = head["host"], head["proc"], head["msg"]
+        if kind is not None and PROC_KIND.get(proc) != kind:
+            return None
 
         if proc == "sshd":
             m = _SSH_FAILED_RE.match(msg)

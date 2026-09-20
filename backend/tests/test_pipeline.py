@@ -3,6 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from db import Database
 from llm import ModelInput, OllamaClient
 from pipeline import Pipeline, fallback_tts
 from redaction import TOKEN_RE
@@ -26,10 +27,10 @@ class RecordingLLM:
         self.inputs: list[ModelInput] = []
         self.prompts: list[str] = []
 
-    def generate(self, mi: ModelInput) -> OllamaOutput:
+    def generate(self, mi: ModelInput, tokens=None) -> OllamaOutput:
         self.inputs.append(mi)
         self.prompts.append(self.inner.build_prompt(mi))
-        return self.inner.generate(mi)
+        return self.inner.generate(mi, tokens)
 
 
 class BadTtsLLM:
@@ -38,15 +39,22 @@ class BadTtsLLM:
     def __init__(self) -> None:
         self.calls = 0
 
-    def generate(self, mi: ModelInput) -> OllamaOutput:
+    def generate(self, mi: ModelInput, tokens=None) -> OllamaOutput:
         self.calls += 1
         good = OllamaClient(fake=True).generate(mi)
         return good.model_copy(update={"tts_summary": "Blocked 185.220.101.34 on port 22. Done."})
 
 
-def run_fixture(lines=None, llm=None, window=30) -> list[EventData]:
-    p = Pipeline(llm=llm or OllamaClient(fake=True), window_sec=window, year=YEAR)
+def run_fixture(lines=None, llm=None, window=30, db=None) -> list[EventData]:
+    p = Pipeline(llm=llm or OllamaClient(fake=True), window_sec=window, year=YEAR, db=db)
     return list(p.run(lines if lines is not None else fixture_lines()))
+
+
+def seeded_db() -> Database:
+    """A DB that has already seen every fixture signature, so the novelty gate stays quiet."""
+    db = Database(":memory:")
+    run_fixture(db=db)
+    return db
 
 
 # --------------------------------------------------------------- contract
@@ -119,11 +127,19 @@ def test_correlation_gate_fires_on_three_distinct_sources_in_a_window():
         f"Sep 19 12:01:3{i} bastion sshd[2090]: Failed password for root from {ip} port 4100{i} ssh2"
         for i, ip in enumerate(["185.220.101.35", "198.51.100.9", "192.0.2.66"])
     ]
-    events = run_fixture(lines)
+    events = run_fixture(lines, db=seeded_db())
     assert len(events) == 3
     for ev in events:
         assert ev.escalation.escalated is True
         assert ev.escalation.gate == "correlation"
+
+
+def test_novelty_gate_fires_on_first_sighting_then_stays_quiet():
+    db = Database(":memory:")
+    first = [ev for ev in run_fixture(db=db) if ev.signature == "ssh.auth.success"]
+    again = [ev for ev in run_fixture(db=db) if ev.signature == "ssh.auth.success"]
+    assert first[0].escalation.gate == "novelty"
+    assert again[0].escalation.escalated is False
 
 
 def test_correlation_gate_silent_for_single_source():

@@ -6,6 +6,16 @@ and demoed against a server that behaves like the real one on the wire.
 
 Run:
     python stub_server.py --port 8765 --rate 6 --scenario scripted
+    python stub_server.py --scenario calm --quiet          # one event/min, one critical, no info/low
+    python stub_server.py --source pipeline --fixture --fake-llm
+    python stub_server.py --source pipeline --syslog 5514 --live-ollama --db sentinel.db
+
+--source pipeline swaps the event source for pipeline.py (same Hub, seq,
+heartbeat, approvals, audio). Approvals then call executor.execute() for real
+and the action_update carries the true outcome; a late Claude verdict re-emits
+the full event with the same event_id and a fresh seq. pipeline.py's flags
+(--fixture/--tail/--syslog, --fake-llm/--live-ollama, --dry-run/--live, --db)
+are accepted and forwarded.
 
 Endpoints:
     WS   /ws                                   the contract channel
@@ -49,6 +59,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
 import schemas as S
+from pipeline import Pipeline, add_pipeline_args, build_from_args
 
 log = logging.getLogger("sentinel.stub")
 
@@ -72,6 +83,9 @@ class Config:
     certfile: str | None = None
     keyfile: str | None = None
     server_id: str = "sentinel-stub-01"
+    source: str = "scripted"      # scripted | pipeline
+    quiet: bool = False           # drop info/low events entirely (UI work)
+    pipeline_args: Any = None     # argparse.Namespace forwarded to pipeline.build_from_args
 
     @property
     def scheme(self) -> str:
@@ -107,6 +121,9 @@ class Hub:
     audio_files: dict[str, Path] = field(default_factory=dict)
     tasks: set[asyncio.Task] = field(default_factory=set)
     silent_sha: str = ""
+    pipe: Pipeline | None = None
+    suppressed: set = field(default_factory=set)   # event_ids dropped by --quiet
+    quiet_dropped: int = 0
 
     # -- envelope -------------------------------------------------------------
     def next_seq(self) -> int:
@@ -136,7 +153,22 @@ class Hub:
             self.clients.discard(ws)
         log.info("-> %-13s seq=%d clients=%d", fr.type, fr.seq, len(self.clients))
 
+    def _quiet_drop(self, type_: str, data: Any) -> bool:
+        if not self.cfg.quiet:
+            return False
+        if type_ == "event" and data.severity in ("info", "low"):
+            self.suppressed.add(data.event_id)
+            return True
+        if type_ in ("audio_ready", "action_update") and data.event_id in self.suppressed:
+            return True
+        return False
+
     async def emit(self, type_: str, data: Any) -> S._Frame:
+        if self._quiet_drop(type_, data):
+            # Build (unsent, seq not consumed) so follow-ups can still reference it.
+            self.quiet_dropped += 1
+            log.info("-- %-13s suppressed by --quiet (%s)", type_, getattr(data, "severity", ""))
+            return S.make_frame(type_, data, seq=self.seq)
         fr = self.frame(type_, data)
         await self.broadcast(fr)
         return fr
@@ -205,8 +237,13 @@ class Hub:
             },
             "pipeline": self.pipeline.model_dump(),
             "scenario": self.cfg.scenario,
+            "source": self.cfg.source,
+            "quiet": self.cfg.quiet,
+            "quiet_dropped": self.quiet_dropped,
             "rate_per_min": self.cfg.rate,
             "audio_base": self.cfg.base_url,
+            "executor": self.pipe.executor.breaker_state() if self.pipe else None,
+            "pipeline_stats": self.pipe.stats.as_text() if self.pipe else None,
         }
 
 
@@ -571,6 +608,21 @@ SCRIPT_ORDER = [
 ]
 assert set(SCRIPT_ORDER) == set(SCENARIOS)
 
+# `calm`: roughly one event per 60s, at most one critical per run, no burst,
+# so the alert panel is not constantly auto-opening during UI work.
+CALM_ORDER = [
+    "info_no_audio",
+    "low_rate_limit_auto",
+    "high_block_ip_pending",
+    "audio_pending_then_ready",
+    "critical_isolate_pending",   # the single critical
+    "escalated_unreachable",
+    "correlation_3_sources",
+    "revoke_session_pending",
+]
+CALM_LOOP = [n for n in CALM_ORDER if n != "critical_isolate_pending"]
+CALM_GAP_S = 60.0
+
 # --------------------------------------------------------------------------- #
 # Background loops
 # --------------------------------------------------------------------------- #
@@ -583,6 +635,8 @@ async def heartbeat_loop(hub: Hub) -> None:
 
 
 def heartbeat_data(hub: Hub) -> S.HeartbeatData:
+    if hub.pipe is not None:
+        hub.pipeline = hub.pipe.status()
     return S.HeartbeatData(
         interval_s=HEARTBEAT_S,
         uptime_s=int(time.monotonic() - hub.started),
@@ -594,17 +648,92 @@ def heartbeat_data(hub: Hub) -> S.HeartbeatData:
 
 async def scenario_loop(hub: Hub) -> None:
     await asyncio.sleep(3)  # let the first client connect
+    first_pass = True
     while True:
-        names = SCRIPT_ORDER if hub.cfg.scenario == "scripted" else [random.choice(SCRIPT_ORDER)]
+        if hub.cfg.scenario == "scripted":
+            names, gap = SCRIPT_ORDER, hub.cfg.step_gap_s
+        elif hub.cfg.scenario == "calm":
+            names, gap = (CALM_ORDER if first_pass else CALM_LOOP), CALM_GAP_S
+        else:
+            names, gap = [random.choice(SCRIPT_ORDER)], hub.cfg.step_gap_s
         for name in names:
             log.info("scenario %s", name)
             try:
                 await SCENARIOS[name](hub)
             except Exception:
                 log.exception("scenario %s failed", name)
-            await asyncio.sleep(hub.cfg.step_gap_s)
-        if hub.cfg.scenario == "scripted":
+            await asyncio.sleep(gap)
+        first_pass = False
+        if hub.cfg.scenario in ("scripted", "calm"):
             log.info("script finished; looping")
+
+
+# --------------------------------------------------------------------------- #
+# --source pipeline: events come from pipeline.py
+# --------------------------------------------------------------------------- #
+
+
+def _with_audio(hub: Hub, ev: S.EventData) -> S.EventData:
+    """Attach the stub's silent clip so the phone's fetch/playback path runs.
+    info is never spoken, so it gets no audio at all."""
+    if ev.audio is not None or ev.severity == "info":
+        return ev
+    return ev.model_copy(update={"audio": hub.new_audio(ev.tts_summary)})
+
+
+async def _emit_pipeline_event(hub: Hub, ev: S.EventData, reemit: bool = False) -> None:
+    if not reemit and ev.action is not None and ev.action.status == "pending_approval" and ev.action.approval_id:
+        hub.pending[ev.action.approval_id] = Pending(
+            approval_id=ev.action.approval_id, event_id=ev.event_id,
+            playbook=ev.action.playbook, expires_at=ev.action.expires_at,
+        )
+    fr = await hub.emit("event", _with_audio(hub, ev))
+    if hub.pipe is not None and not reemit:
+        hub.pipe.db.update_event(ev.event_id, seq=fr.seq)
+
+
+async def pipeline_loop(hub: Hub) -> None:
+    """Run the (synchronous) pipeline on a worker thread; emit on the loop."""
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue[tuple[S.EventData, bool] | None] = asyncio.Queue()
+
+    def push(ev: S.EventData, reemit: bool) -> None:
+        loop.call_soon_threadsafe(q.put_nowait, (ev, reemit))
+
+    def on_update(ev: S.EventData) -> None:   # late Claude verdict, worker thread
+        push(ev, True)
+
+    pipe, lines, listener = build_from_args(hub.cfg.pipeline_args, on_update=on_update)
+    hub.pipe = pipe
+    if listener is not None:
+        await listener.start()
+
+    def consume() -> None:
+        try:
+            for ev in pipe.run(lines):
+                push(ev, False)
+        except Exception:
+            log.exception("pipeline stopped")
+            pipe.log_source_state = "unreachable"
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, None)
+
+    await asyncio.sleep(3)  # let the first client connect, same as scenario_loop
+    worker = loop.run_in_executor(None, consume)
+    log.info("pipeline source up: %s", pipe.stats.as_text())
+    while True:
+        item = await q.get()
+        if item is None:
+            break
+        ev, reemit = item
+        try:
+            await _emit_pipeline_event(hub, ev, reemit)
+        except Exception:
+            log.exception("failed to emit event %s", ev.event_id)
+    await worker
+    log.info("pipeline source finished: %s", pipe.stats.as_text())
+    while True:  # the fixture ran out; stay up so the phone keeps its heartbeat
+        await asyncio.sleep(3600)
 
 
 async def expiry_loop(hub: Hub) -> None:
@@ -614,6 +743,9 @@ async def expiry_loop(hub: Hub) -> None:
         for aid, p in list(hub.pending.items()):
             if now > p.expires_at:
                 hub.pending.pop(aid, None)
+                if hub.pipe is not None:
+                    hub.pipe.executor.expire(aid)
+                    hub.pipe.db.update_event(p.event_id, action_status="expired")
                 await hub.emit(
                     "action_update",
                     S.ActionUpdateData(
@@ -659,6 +791,13 @@ async def handle_client_frame(hub: Hub, ws: WebSocket, fr: S._Frame) -> None:
             status, reason, expires_at, playbook = "failed", "event_id does not match approval", p.expires_at, p.playbook
         elif d.decision == "approved" and not d.biometric:
             status, reason, expires_at, playbook = "denied", "approval without biometric is refused", p.expires_at, p.playbook
+        elif hub.pipe is not None:
+            # Real executor: the status is whatever actually happened.
+            hub.pending.pop(d.approval_id, None)
+            ex = hub.pipe.executor
+            res = await asyncio.to_thread(ex.approve if d.decision == "approved" else ex.deny, d.approval_id)
+            status, reason, expires_at, playbook = res.status, res.reason[:200], res.expires_at, p.playbook
+            hub.pipe.db.update_event(d.event_id, action_status=status)
         else:
             hub.pending.pop(d.approval_id, None)
             status, reason, expires_at, playbook = d.decision, f"{d.decision} on device", None, p.playbook
@@ -732,14 +871,17 @@ async def lifespan(app: FastAPI):
     HUB = Hub(cfg=CONFIG)
     HUB.silent_sha = ensure_silent_mp3(SILENT_MP3)
     HUB.audio_files["silence"] = SILENT_MP3
-    loops = [asyncio.create_task(c(HUB)) for c in (heartbeat_loop, scenario_loop, expiry_loop)]
-    log.info("stub up: ws://%s:%d/ws  audio base %s  scenario=%s rate=%.1f/min",
-             CONFIG.host, CONFIG.port, CONFIG.base_url, CONFIG.scenario, CONFIG.rate)
+    source_loop = pipeline_loop if CONFIG.source == "pipeline" else scenario_loop
+    loops = [asyncio.create_task(c(HUB)) for c in (heartbeat_loop, source_loop, expiry_loop)]
+    log.info("stub up: ws://%s:%d/ws  audio base %s  source=%s scenario=%s rate=%.1f/min quiet=%s",
+             CONFIG.host, CONFIG.port, CONFIG.base_url, CONFIG.source, CONFIG.scenario, CONFIG.rate, CONFIG.quiet)
     try:
         yield
     finally:
         for t in loops + list(HUB.tasks):
             t.cancel()
+        if HUB.pipe is not None and HUB.pipe.escalator is not None:
+            HUB.pipe.escalator.drain()
 
 
 app = FastAPI(title="Sentinel stub", lifespan=lifespan)
@@ -818,6 +960,14 @@ async def debug_restore() -> dict[str, Any]:
     return HUB.pipeline.model_dump()
 
 
+@app.get("/debug/breaker/reset")
+async def debug_breaker_reset() -> dict[str, Any]:
+    if HUB.pipe is None:
+        raise HTTPException(400, "no executor with --source scripted")
+    HUB.pipe.executor.reset()
+    return HUB.pipe.executor.breaker_state()
+
+
 @app.get("/debug/emit")
 async def debug_emit(scenario: str) -> dict[str, Any]:
     fn = SCENARIOS.get(scenario)
@@ -839,7 +989,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--port", type=int, default=CONFIG.port)
     ap.add_argument("--host", default=CONFIG.host, help="bind address")
     ap.add_argument("--rate", type=float, default=CONFIG.rate, help="events per minute between scenario steps")
-    ap.add_argument("--scenario", choices=["scripted", "random"], default=CONFIG.scenario)
+    ap.add_argument("--scenario", choices=["scripted", "random", "calm"], default=CONFIG.scenario,
+                    help="calm: ~1 event/60s, at most one critical per run")
+    ap.add_argument("--source", choices=["scripted", "pipeline"], default=CONFIG.source,
+                    help="pipeline: events from pipeline.py (flags below); scripted: the scenario list")
+    ap.add_argument("--quiet", action="store_true", help="suppress info and low severity events entirely")
+    add_pipeline_args(ap)
     ap.add_argument("--advertise", default=None, help="host to put in audio URLs (default: detected LAN IP)")
     ap.add_argument("--certfile", default=None, help="PEM cert; enables wss:// and https audio URLs")
     ap.add_argument("--keyfile", default=None, help="PEM key for --certfile")
@@ -856,6 +1011,12 @@ def main(argv: list[str] | None = None) -> None:
     CONFIG.host, CONFIG.port, CONFIG.rate, CONFIG.scenario = a.host, a.port, a.rate, a.scenario
     CONFIG.certfile, CONFIG.keyfile = a.certfile, a.keyfile
     CONFIG.advertise = a.advertise or detect_lan_ip()
+    CONFIG.source, CONFIG.quiet, CONFIG.pipeline_args = a.source, a.quiet, a
+    if a.source == "pipeline":
+        if not (a.fixture or a.tail or a.syslog):
+            ap.error("--source pipeline needs one of --fixture / --tail / --syslog")
+        if not (a.fake_llm or a.live_ollama):
+            ap.error("--source pipeline needs --fake-llm or --live-ollama")
 
     logging.basicConfig(level=a.log_level.upper(), format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     uvicorn.run(

@@ -94,6 +94,18 @@ class Aggregator:
             out.extend(self._emit(i))
         return out
 
+    def flush_before(self, now: datetime, grace_sec: int = 5) -> list[AggregatedEvent]:
+        """Emit windows that ended more than `grace_sec` before `now`.
+
+        Live sources (tail, syslog) go quiet; without this a window would sit
+        unemitted until the next line arrived. Fixture replay never needs it.
+        """
+        cutoff = self._window_index(now - timedelta(seconds=grace_sec))
+        out: list[AggregatedEvent] = []
+        for i in sorted(i for i in self._windows if i < cutoff):
+            out.extend(self._emit(i))
+        return out
+
     def flush(self) -> list[AggregatedEvent]:
         out: list[AggregatedEvent] = []
         for i in sorted(self._windows):
