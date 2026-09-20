@@ -35,7 +35,14 @@ EnvironmentFile=__ROOT__/backend/.env
 Environment=SENTINEL_ASSETS_FILE=__ROOT__/tools/protected_assets.serverpi.yaml
 
 # --source pipeline  real events, not scripted scenarios
-# --syslog           listen for forwarded logs (UDP+TCP 5514)
+# --tail             follow serverpi's own auth.log. Real, live events with no
+#                    forwarding set up yet: every SSH attempt against this box
+#                    lands here. Switch to --syslog once other machines forward
+#                    to :5514, which is the venue configuration.
+#
+#                    REQUIRES rsyslog writing BSD-format lines. Debian 13
+#                    defaults to RFC3339, which parsers.py _SYSLOG_RE does not
+#                    match, so nothing parses. See tools/rsyslog-sentinel.conf.
 # --live-ollama      the model on the PC, via OLLAMA_BASE_URL
 # --db               persist events and the redaction map across restarts
 # --certfile/keyfile wss://, which the app requires and pins
@@ -46,7 +53,7 @@ Environment=SENTINEL_ASSETS_FILE=__ROOT__/tools/protected_assets.serverpi.yaml
 # Executor stays in dry run: --live is deliberately absent. Invariant 10.
 ExecStart=__ROOT__/backend/.venv/bin/python stub_server.py \
     --source pipeline \
-    --syslog \
+    --tail /var/log/auth.log \
     --live-ollama \
     --db __ROOT__/backend/sentinel.db \
     --certfile __ROOT__/backend/certs/cert.pem \
