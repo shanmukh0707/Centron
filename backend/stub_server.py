@@ -43,7 +43,9 @@ import argparse
 import asyncio
 import hashlib
 import logging
+import os
 import random
+import secrets
 import socket
 import time
 from collections import deque
@@ -54,7 +56,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
@@ -887,8 +889,49 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Sentinel stub", lifespan=lifespan)
 
 
+# --------------------------------------------------------------------------- #
+# Client authentication
+#
+# contracts.md: "the pinned cert plus the pre-shared token is what actually
+# authenticates the client." `biometric: true` on an approve_action is a claim
+# the app makes about its operator, not proof of anything to us.
+#
+# Disabled when SENTINEL_TOKEN is unset, so fixture runs, the test suite and
+# local UI work are unaffected. Set it on serverpi and the door is shut.
+#
+# This is not a replacement for TLS. Over plaintext the token is readable by
+# anyone on the path; it is only meaningful behind --certfile/--keyfile.
+# --------------------------------------------------------------------------- #
+
+SENTINEL_TOKEN = os.environ.get("SENTINEL_TOKEN", "").strip()
+
+
+def _token_from_header(value: str | None) -> str:
+    if not value:
+        return ""
+    prefix = "bearer "
+    return value[len(prefix):].strip() if value.lower().startswith(prefix) else value.strip()
+
+
+def _authorized(header_value: str | None) -> bool:
+    if not SENTINEL_TOKEN:
+        return True  # auth disabled
+    # compare_digest: token check must not leak length or prefix via timing.
+    return secrets.compare_digest(_token_from_header(header_value), SENTINEL_TOKEN)
+
+
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
+    if not _authorized(ws.headers.get("authorization")):
+        # Refused during the handshake, so the client sees a failed upgrade
+        # rather than a connection that opens and then goes quiet.
+        peer_ = f"{ws.client.host}" if ws.client else "?"
+        log.warning("rejected unauthenticated ws connection from %s", peer_)
+        await ws.close(code=1008, reason="unauthorized")
+        return
+
     await ws.accept()
     HUB.clients.add(ws)
     peer = f"{ws.client.host}:{ws.client.port}" if ws.client else "?"
@@ -921,7 +964,11 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
 
 @app.get("/audio/{audio_id}.mp3")
-async def audio(audio_id: str) -> FileResponse:
+async def audio(audio_id: str, authorization: str | None = Header(default=None)) -> FileResponse:
+    # Same token as the socket: the contract has the phone fetching audio over
+    # the same session with the same bearer.
+    if not _authorized(authorization):
+        raise HTTPException(401, "unauthorized")
     path = HUB.audio_files.get(audio_id)
     if path is None or not path.exists():
         raise HTTPException(404, "unknown audio_id")

@@ -11,6 +11,11 @@
 #
 # Override the path with SENTINEL_ASSETS_FILE; append entries with
 # SENTINEL_PROTECTED_ASSETS="10.0.0.5,nas01" (comma separated).
+#
+# THIS FILE STAYS EMPTY. tests/test_assets_ingest.py asserts it, deliberately:
+# a checked-in list would be one person's network silently applied to everyone
+# else's. The real list for serverpi lives in
+# tools/protected_assets.serverpi.yaml and is selected with SENTINEL_ASSETS_FILE.
 
 protected_assets:
   # - 192.168.1.1        # gateway / router (the LAN side of the ISP box)
