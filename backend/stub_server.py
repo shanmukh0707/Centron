@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
@@ -1178,6 +1178,84 @@ async def debug_tts(
         raise HTTPException(502, f"render failed on {HUB.tts.engine}; see the journal")
     ref = HUB._ref_from("aud_" + S.uuid7().hex[:16], key, rendered)
     return {"engine": rendered.engine, "tts": HUB.health.tts_state(), "audio": ref.model_dump(mode="json")}
+
+
+CHAT_SYSTEM = (
+    "You are Centron, an assistant embedded in a home lab security console. "
+    "The person you are talking to owns this lab and is looking at their phone. "
+    "Answer in at most four sentences, plainly, no markdown and no bullet lists, "
+    "because your reply is rendered in a small chat bubble. "
+    "If you are asked to do something that would change the state of a machine, "
+    "explain that actions go through the approval flow with a fingerprint and are "
+    "never taken from chat. If you do not know something about their specific "
+    "hardware, say so rather than guessing."
+)
+
+
+@app.post("/chat")
+async def chat(
+    body: dict[str, Any] = Body(...),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Ask Claude a question from one of the app's chat boxes.
+
+    Deliberately an HTTP endpoint rather than a new frame type: the WebSocket
+    contract in schemas.py is not mine to extend, and chat is request/response
+    anyway, so it does not want to share the event stream's ordering.
+
+    Only the operator's own words and a scope label are sent. No log lines, no
+    addresses, no event payloads -- escalation already has a redaction path for
+    that and this endpoint has no business reimplementing it badly.
+    """
+    if not _authorized(authorization):
+        raise HTTPException(401, "unauthorized")
+
+    message = str(body.get("message", "")).strip()
+    if not message:
+        raise HTTPException(400, "empty message")
+    scope = str(body.get("scope", "this home lab")).strip() or "this home lab"
+
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise HTTPException(503, "ANTHROPIC_API_KEY is not set on the engine")
+
+    # Recent turns, so a follow-up question is not answered blind. Trimmed
+    # because the phone should not be able to push an unbounded prompt.
+    history = body.get("history") or []
+    messages: list[dict[str, str]] = []
+    for turn in history[-6:]:
+        role = "assistant" if str(turn.get("role")) == "assistant" else "user"
+        text = str(turn.get("text", "")).strip()[:2000]
+        if text:
+            messages.append({"role": role, "content": text})
+    messages.append({"role": "user", "content": message[:2000]})
+
+    def ask() -> str:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=key, timeout=30.0, max_retries=0)
+        resp = client.messages.create(
+            model=os.environ.get("SENTINEL_CLAUDE_MODEL", "claude-opus-5"),
+            max_tokens=400,
+            system=f"{CHAT_SYSTEM}\n\nThe question is about: {scope}.",
+            messages=messages,
+        )
+        return " ".join(
+            b.text.strip()
+            for b in getattr(resp, "content", [])
+            if getattr(b, "type", None) == "text"
+        ).strip()
+
+    try:
+        # Blocking SDK call, so off the loop: it is serving a live socket.
+        reply = await asyncio.get_running_loop().run_in_executor(None, ask)
+    except Exception as e:
+        log.warning("chat failed: %s: %s", type(e).__name__, e)
+        raise HTTPException(502, f"chat failed: {type(e).__name__}")
+
+    if not reply:
+        raise HTTPException(502, "empty reply")
+    return {"reply": reply}
 
 
 @app.get("/debug/emit")

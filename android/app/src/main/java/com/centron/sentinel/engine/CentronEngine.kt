@@ -97,6 +97,11 @@ class UnreachableEngine : CentronEngine {
 }
 
 object Engines {
-    /** Swap this for a real client once the engine speaks. */
-    val current: CentronEngine = UnreachableEngine()
+    /**
+     * Chat reaches the engine for real. Device probing, alert history and
+     * revert still report unreachable — see [HttpEngine].
+     */
+    val current: CentronEngine = HttpEngine {
+        com.centron.sentinel.settings.AppSettings.engineConfig.value
+    }
 }
