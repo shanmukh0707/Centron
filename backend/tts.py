@@ -52,8 +52,8 @@ MP3_BITRATE_KBPS = 64
 ESPEAK_VOICE = os.environ.get("SENTINEL_ESPEAK_VOICE", "en-us+f3")
 ESPEAK_WPM = os.environ.get("SENTINEL_ESPEAK_WPM", "165")
 
-ELEVEN_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
-ELEVEN_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+ELEVEN_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "7p1Ofvcwsv7UBPoFNcpI")
+ELEVEN_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_v3")
 
 
 @dataclass(frozen=True)
@@ -127,6 +127,7 @@ class Renderer:
                 # serving a file the phone cannot decode.
                 target.unlink(missing_ok=True)
 
+        engine_used = self.engine
         try:
             if self.engine == "elevenlabs":
                 dur = self._render_elevenlabs(text, target)
@@ -135,7 +136,22 @@ class Renderer:
         except Exception as e:
             log.warning("tts render failed (%s): %s: %s", self.engine, type(e).__name__, e)
             target.unlink(missing_ok=True)
-            return None
+
+            # A bad key, a wrong voice id, a rejected model or a network blip
+            # must not turn the product mute. espeak is worse, and worse is
+            # very much better than silent -- the whole pitch is that the
+            # phone talks.
+            if self.engine == "elevenlabs" and self._espeak and self._lame:
+                try:
+                    dur = self._render_espeak(text, target)
+                    engine_used = "espeak-ng"
+                    log.warning("fell back to espeak-ng for this phrase")
+                except Exception as e2:
+                    log.warning("espeak fallback also failed: %s: %s", type(e2).__name__, e2)
+                    target.unlink(missing_ok=True)
+                    return None
+            else:
+                return None
 
         if not target.exists() or target.stat().st_size == 0:
             log.warning("tts produced no audio for %r", text[:60])
@@ -143,7 +159,7 @@ class Renderer:
             return None
 
         digest = _sha256(target)
-        return Rendered(path=target, duration_ms=dur, sha256=digest, engine=self.engine)
+        return Rendered(path=target, duration_ms=dur, sha256=digest, engine=engine_used)
 
     # -------------------------------------------------------------- backends
 
@@ -172,11 +188,7 @@ class Renderer:
         req = urllib.request.Request(
             f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
             f"?output_format=mp3_22050_32",
-            data=_json_bytes({
-                "text": text,
-                "model_id": ELEVEN_MODEL,
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-            }),
+            data=_json_bytes(_eleven_body(text)),
             headers={
                 "xi-api-key": self._eleven_key,
                 "Content-Type": "application/json",
@@ -190,6 +202,19 @@ class Renderer:
             shutil.copyfileobj(resp, fh)
 
         return _mp3_duration_ms(target, bitrate_kbps=32)
+
+
+def _eleven_body(text: str) -> dict:
+    """Request body for one phrase.
+
+    v3 does not take the v2 voice_settings shape, and sending them gets the
+    request rejected outright. Older models still want them, so the settings
+    are attached only where they are understood.
+    """
+    body: dict = {"text": text, "model_id": ELEVEN_MODEL}
+    if not ELEVEN_MODEL.startswith("eleven_v3"):
+        body["voice_settings"] = {"stability": 0.5, "similarity_boost": 0.75}
+    return body
 
 
 # ---------------------------------------------------------------- helpers
