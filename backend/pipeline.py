@@ -19,8 +19,9 @@ Provenance rules (enforced here, not trusted to the model):
     executor: ActionRef.status records the classification decision
     (auto-eligible vs pending approval), nothing is executed.
 
-CLI:
-    python pipeline.py --fixture fixtures/sample_logs.txt --fake-llm --window 30
+CLI (run from backend/ or anywhere; the fixture default is anchored to this file):
+    python pipeline.py --fixture --fake-llm --window 30
+    python pipeline.py --fixture fixtures/sample_logs.txt --fake-llm
     python pipeline.py --tail /var/log/auth.log --fake-llm
 """
 
@@ -32,6 +33,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
 
 from aggregator import AggregatedEvent, Aggregator
@@ -54,6 +56,9 @@ from schemas import (
     validate_and_classify,
     validate_tts,
 )
+
+HERE = Path(__file__).resolve().parent
+DEFAULT_FIXTURE = HERE / "fixtures" / "sample_logs.txt"
 
 _USER_ID_RE = re.compile(r"^[A-Za-z0-9._@-]{1,128}$")
 _HOST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -281,7 +286,8 @@ class Pipeline:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Sentinel Phase 1 ingestion pipeline")
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--fixture", help="replay a static log file")
+    src.add_argument("--fixture", nargs="?", const=str(DEFAULT_FIXTURE),
+                     help=f"replay a static log file (default: {DEFAULT_FIXTURE.relative_to(HERE)})")
     src.add_argument("--tail", help="follow a live log file")
     ap.add_argument("--rate", type=float, default=0.0, help="fixture replay rate, lines/sec (0 = max)")
     ap.add_argument("--window", type=int, default=30, help="aggregation window, 30..60 seconds")

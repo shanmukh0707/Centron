@@ -10,10 +10,10 @@ Single source of truth for:
 
 Nothing here executes anything. No network, no DB, no model calls.
 
-CLI:
-    python schemas.py schema  [contract.json]   # dump JSON schema
-    python schemas.py samples [samples/]        # (re)write golden samples
-    python schemas.py check   [samples/]        # validate golden samples
+CLI (paths default to this file's directory, so cwd does not matter):
+    python schemas.py schema  [backend/contract.json]   # dump JSON schema
+    python schemas.py samples [backend/samples/]        # (re)write golden samples
+    python schemas.py check   [backend/samples/]        # validate golden samples
 """
 
 from __future__ import annotations
@@ -962,7 +962,12 @@ def build_json_schema() -> dict[str, Any]:
     return root
 
 
-def export_json_schema(path: str | Path = "contract.json") -> Path:
+HERE = Path(__file__).resolve().parent
+DEFAULT_CONTRACT_PATH = HERE / "contract.json"
+DEFAULT_SAMPLES_DIR = HERE / "samples"
+
+
+def export_json_schema(path: str | Path = DEFAULT_CONTRACT_PATH) -> Path:
     """Write the full envelope union (plus OllamaOutput) as JSON Schema 2020-12.
 
     Android: quicktype --lang kotlin --framework kotlinx -s schema contract.json
@@ -1055,7 +1060,7 @@ def build_samples() -> dict[str, _Frame]:
     return {t: make_frame(t, d, seq=i + 1, ts=_T0) for i, (t, d) in enumerate(payloads)}
 
 
-def write_samples(samples_dir: str | Path = "samples") -> list[Path]:
+def write_samples(samples_dir: str | Path = DEFAULT_SAMPLES_DIR) -> list[Path]:
     d = Path(samples_dir)
     d.mkdir(parents=True, exist_ok=True)
     written = []
@@ -1066,7 +1071,7 @@ def write_samples(samples_dir: str | Path = "samples") -> list[Path]:
     return written
 
 
-def validate_samples(samples_dir: str | Path = "samples") -> dict[str, _Frame]:
+def validate_samples(samples_dir: str | Path = DEFAULT_SAMPLES_DIR) -> dict[str, _Frame]:
     """Parse every samples/*.json through the union. Raises on the first problem.
 
     Also insists that one file exists per frame type and that each file's
@@ -1102,11 +1107,11 @@ def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("schema", help="write contract.json")
-    s.add_argument("path", nargs="?", default="contract.json")
+    s.add_argument("path", nargs="?", default=str(DEFAULT_CONTRACT_PATH))
     s = sub.add_parser("samples", help="write golden samples")
-    s.add_argument("dir", nargs="?", default="samples")
+    s.add_argument("dir", nargs="?", default=str(DEFAULT_SAMPLES_DIR))
     s = sub.add_parser("check", help="validate golden samples")
-    s.add_argument("dir", nargs="?", default="samples")
+    s.add_argument("dir", nargs="?", default=str(DEFAULT_SAMPLES_DIR))
     args = ap.parse_args(argv)
 
     if args.cmd == "schema":
