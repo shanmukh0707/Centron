@@ -86,6 +86,7 @@ class LineParser:
         self.year = year or datetime.now(timezone.utc).year
         self.parsed = 0
         self.dropped = 0
+        self.malformed = 0  # subset of dropped: the syslog header itself did not match
 
     def parse(self, line: str, kind: str | None = None) -> ParsedLine | None:
         """`kind` (auth | firewall | dns) restricts which family is tried; None tries all."""
@@ -105,6 +106,7 @@ class LineParser:
     def _parse(self, line: str, kind: str | None = None) -> ParsedLine | None:
         head = _SYSLOG_RE.match(line)
         if head is None:
+            self.malformed += 1
             return None
         try:
             ts = datetime(
@@ -112,6 +114,7 @@ class LineParser:
                 int(head["h"]), int(head["m"]), int(head["s"]), tzinfo=timezone.utc,
             )
         except (KeyError, ValueError):
+            self.malformed += 1
             return None
         host, proc, msg = head["host"], head["proc"], head["msg"]
         if kind is not None and PROC_KIND.get(proc) != kind:

@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -145,8 +146,15 @@ class ClaudeEscalator:
         self.unreachable = 0
         self.last_error: str | None = None
         self._warned_no_key = False
+        # pipeline.SubsystemHealth, set by the Pipeline that owns this
+        # escalator. Every real attempt reports its outcome and latency there.
+        self.health: Any | None = None
 
     # -------------------------------------------------------------- status
+    @property
+    def has_credentials(self) -> bool:
+        return self.api_key is not None or self._client is not None
+
     @property
     def status(self) -> str:
         if self.api_key is None and self._client is None:
@@ -193,13 +201,18 @@ class ClaudeEscalator:
         """Synchronous. Returns (state, localized_verdict). Never raises, except
         LeakError, which is raised on purpose before anything is sent."""
         payload_json = assert_no_leak(payload, rmap)
+        t0 = time.monotonic()
         try:
             raw = self._ask(payload_json)
         except Exception as e:  # noqa: BLE001 - every failure mode is "unreachable"
             self.unreachable += 1
             self.last_error = f"{type(e).__name__}: {e}"[:200]
+            if self.health is not None:
+                self.health.note_claude_result(False, time.monotonic() - t0)
             log.warning("claude escalation for %s failed: %s", event_id, self.last_error)
             return "unreachable", None
+        if self.health is not None:
+            self.health.note_claude_result(True, time.monotonic() - t0)
         verdict = rmap.localize(raw)[:VERDICT_MAX_CHARS]
         self.answered += 1
         self.last_error = None

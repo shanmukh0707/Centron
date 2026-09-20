@@ -181,6 +181,7 @@ class RateController:
         self.per_signature = per_signature_per_hour
         self.global_ceiling = global_per_hour
         self.queued = 0
+        self.global_ceiling_hit = False  # last admit() queued because of the global ceiling
 
     def _since(self) -> datetime:
         return datetime.fromtimestamp(self.clock(), tz=timezone.utc) - COOLDOWN
@@ -188,7 +189,8 @@ class RateController:
     def admit(self, signature: str) -> tuple[str, str | None]:
         """('pending', None) if Claude may be called now, else ('queued_digest', why)."""
         since = self._since()
-        if self.db.escalations_since_global(since) >= self.global_ceiling:
+        self.global_ceiling_hit = self.db.escalations_since_global(since) >= self.global_ceiling
+        if self.global_ceiling_hit:
             self.queued += 1
             return QUEUED_DIGEST, f"global ceiling {self.global_ceiling}/h reached"
         if self.db.escalations_since(signature, since) >= self.per_signature:

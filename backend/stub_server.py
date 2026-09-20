@@ -61,7 +61,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
 import schemas as S
-from pipeline import Pipeline, add_pipeline_args, build_from_args
+from pipeline import Pipeline, SubsystemHealth, add_pipeline_args, build_from_args
 from tts import Rendered, Renderer
 
 log = logging.getLogger("sentinel.stub")
@@ -133,6 +133,13 @@ class Hub:
     # Rendered audio, keyed on the contract's cache_key so a repeated phrase is
     # synthesised once. audio_files maps ids; this maps content.
     tts_cache: dict[str, Rendered] = field(default_factory=dict)
+    # Subsystem state for the heartbeat when no pipeline owns one (--source
+    # scripted). With a pipeline, `health` is the pipeline's own object.
+    standby_health: SubsystemHealth = field(default_factory=SubsystemHealth)
+
+    @property
+    def health(self) -> SubsystemHealth:
+        return self.pipe.health if self.pipe is not None else self.standby_health
 
     # -- envelope -------------------------------------------------------------
     def next_seq(self) -> int:
@@ -262,6 +269,23 @@ class Hub:
             cache_key=pending.cache_key,
         )
 
+    async def render_now(self, text: str, cache_key: str | None = None) -> Rendered | None:
+        """One real render on a worker thread, outcome recorded in health.
+
+        Every render goes through here so the heartbeat's tts word is backed
+        by what render() last actually did, not by which engine was picked at
+        startup.
+        """
+        if self.tts is None or not self.tts.available:
+            return None
+        key = cache_key or self.cache_key_for(text)
+        loop = asyncio.get_running_loop()
+        rendered = await loop.run_in_executor(None, self.tts.render, text, key)
+        self.health.note_tts_render(rendered is not None)
+        if rendered is not None:
+            self.tts_cache[key] = rendered
+        return rendered
+
     def render_audio(self, event_id: Any, ref: S.AudioRef, text: str) -> None:
         """Render off the event path, then announce with audio_ready.
 
@@ -273,10 +297,8 @@ class Hub:
             return
 
         async def run() -> None:
-            loop = asyncio.get_running_loop()
-            rendered = await loop.run_in_executor(
-                None, self.tts.render, text, ref.cache_key or self.cache_key_for(text)
-            )
+            key = ref.cache_key or self.cache_key_for(text)
+            rendered = await self.render_now(text, key)
             if rendered is None:
                 # Contract: never block an event on TTS. It already shipped;
                 # say the audio failed and move on.
@@ -287,8 +309,6 @@ class Hub:
                 ))
                 return
 
-            key = ref.cache_key or self.cache_key_for(text)
-            self.tts_cache[key] = rendered
             await self.emit("audio_ready", S.AudioReadyData(
                 event_id=event_id,
                 audio=self._ref_from(ref.audio_id, key, rendered),
@@ -721,16 +741,15 @@ async def heartbeat_loop(hub: Hub) -> None:
 
 
 def heartbeat_data(hub: Hub) -> S.HeartbeatData:
+    """Cached SubsystemHealth only. This path never probes anything: a
+    heartbeat that blocks on a dead Ollama box would stop the heartbeat, which
+    is the one thing that has to keep going when everything else is down."""
     if hub.pipe is not None:
         hub.pipeline = hub.pipe.status()
-
-    # pipeline.status() hard-codes tts="degraded" because historically there
-    # was no renderer. Now there is, so report what it can actually do:
-    # ok on ElevenLabs, degraded on the local fallback, unreachable with
-    # neither. The phone shows this subsystem amber, and it should only be
-    # amber when it deserves to be.
-    if hub.tts is not None:
-        hub.pipeline = hub.pipeline.model_copy(update={"tts": hub.tts.status_word()})
+    else:
+        # Scripted source: the other three subsystems are stage props (and
+        # /debug/degrade may be driving them); tts is real either way.
+        hub.pipeline = hub.pipeline.model_copy(update={"tts": hub.health.tts_state()})
 
     return S.HeartbeatData(
         interval_s=HEARTBEAT_S,
@@ -811,6 +830,8 @@ async def pipeline_loop(hub: Hub) -> None:
 
     pipe, lines, listener = build_from_args(hub.cfg.pipeline_args, on_update=on_update)
     hub.pipe = pipe
+    if hub.tts is not None:
+        pipe.health.note_tts_engine(hub.tts.engine)
     if listener is not None:
         await listener.start()
 
@@ -978,6 +999,7 @@ async def lifespan(app: FastAPI):
     HUB.silent_sha = ensure_silent_mp3(SILENT_MP3)
     HUB.audio_files["silence"] = SILENT_MP3
     HUB.tts = Renderer()
+    HUB.standby_health.note_tts_engine(HUB.tts.engine)
     source_loop = pipeline_loop if CONFIG.source == "pipeline" else scenario_loop
     loops = [asyncio.create_task(c(HUB)) for c in (heartbeat_loop, source_loop, expiry_loop)]
     log.info("stub up: ws://%s:%d/ws  audio base %s  source=%s scenario=%s rate=%.1f/min quiet=%s",
@@ -1118,6 +1140,29 @@ async def debug_breaker_reset() -> dict[str, Any]:
         raise HTTPException(400, "no executor with --source scripted")
     HUB.pipe.executor.reset()
     return HUB.pipe.executor.breaker_state()
+
+
+@app.get("/debug/tts")
+async def debug_tts(
+    text: str = Query("Sentinel preflight check. The speech path is working.", min_length=1, max_length=200),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """One real render, same path an event takes, returned as a ready AudioRef.
+
+    tools/preflight.sh fetches the URL, checks the digest and listens for
+    silence. A success here is also what flips the heartbeat's tts to ok on an
+    ElevenLabs box: the renderer is proven by rendering, not by having a key.
+    """
+    if not _authorized(authorization):
+        raise HTTPException(401, "unauthorized")
+    if HUB.tts is None or not HUB.tts.available:
+        raise HTTPException(503, "no tts renderer (no ELEVENLABS_API_KEY and no espeak-ng+lame)")
+    key = HUB.cache_key_for(text)
+    rendered = await HUB.render_now(text, key)
+    if rendered is None:
+        raise HTTPException(502, f"render failed on {HUB.tts.engine}; see the journal")
+    ref = HUB._ref_from("aud_" + S.uuid7().hex[:16], key, rendered)
+    return {"engine": rendered.engine, "tts": HUB.health.tts_state(), "audio": ref.model_dump(mode="json")}
 
 
 @app.get("/debug/emit")

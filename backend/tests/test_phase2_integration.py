@@ -332,5 +332,9 @@ def test_blast_radius_gate_when_signature_is_known():
 def test_status_reports_subsystems():
     pipe = build(claude=FakeClaude())
     st = pipe.status()
-    assert st.ollama == "ok" and st.claude == "ok" and st.log_source == "ok"
+    # Credentials alone prove nothing: claude is degraded until a call succeeds.
+    assert st.ollama == "ok" and st.claude == "degraded" and st.log_source == "ok"
+    list(pipe.run(fixture_lines()))
+    pipe.escalator.drain()
+    assert pipe.status().claude == "ok"
     assert build().status().claude == "unreachable"

@@ -169,6 +169,35 @@ def test_heartbeat_reflects_pipeline_subsystems():
         state = srv.state()
         assert state["pipeline"]["ollama"] == "ok"
         assert state["pipeline"]["claude"] == "unreachable"  # no ANTHROPIC_API_KEY in tests
+        assert state["pipeline"]["tts"] in ("degraded", "unreachable")  # never ok without a proven render
+    finally:
+        srv.stop()
+
+
+def test_debug_tts_round_trips_a_real_render_or_says_why_not():
+    """tools/preflight.sh's audio check. Skips the byte checks on a box with
+    no renderer, but the endpoint must still answer honestly (503)."""
+    import hashlib
+    from urllib.error import HTTPError
+
+    srv = Server(*PIPELINE_ARGS)
+    try:
+        srv.wait()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/debug/tts", timeout=40) as r:
+                body = json.loads(r.read())
+        except HTTPError as e:
+            assert e.code in (502, 503), e.code
+            pytest.skip("no tts renderer on this box")
+        ref = body["audio"]
+        assert ref["status"] == "ready" and ref["url"].endswith(f"/audio/{ref['audio_id']}.mp3")
+        # Fetch on the loopback port the test knows, not the advertised LAN address.
+        with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/audio/{ref['audio_id']}.mp3", timeout=5) as r:
+            data = r.read()
+        assert hashlib.sha256(data).hexdigest() == ref["sha256"]
+        assert data[:3] == b"ID3" or data[0] == 0xFF
+        state = srv.state()
+        assert state["pipeline"]["tts"] == ("ok" if body["engine"] == "elevenlabs" else "degraded")
     finally:
         srv.stop()
 

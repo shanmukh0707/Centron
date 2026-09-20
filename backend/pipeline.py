@@ -39,9 +39,11 @@ import logging
 import os
 import queue
 import re
+import statistics
 import sys
 import threading
-from collections import OrderedDict
+import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Protocol
@@ -54,7 +56,7 @@ from executor import Executor
 from gates import QUEUED_DIGEST, EscalationDecision, GateInput, RateController, combine_gates, is_cap_reason
 from ingest import DEFAULT_PORT as DEFAULT_SYSLOG_PORT
 from ingest import SyslogListener, TaggedLine, load_source_map
-from llm import ModelInput, OllamaClient, OllamaUnreachable, SchemaFailure
+from llm import LATENCY_WARN_P50_SEC, LATENCY_WINDOW, ModelInput, OllamaClient, OllamaUnreachable, SchemaFailure
 from log_source import replay_fixture, tail_file
 from parsers import SIGNATURE_META, LineParser, SignatureMeta
 from redaction import IDENTIFIER_RE, TOKEN_RE, LeakError, RedactionMap
@@ -123,6 +125,188 @@ def fallback_tts(signature: str, severity: str) -> str:
     return f"{_SEVERITY_PREFIX.get(severity, 'Notice')}: {body}."
 
 
+# ----------------------------------------------------------------- health
+CLAUDE_SLOW_SEC = 6.0
+CLAUDE_CEILING_SEC = 3600.0          # RateController's hourly window
+LOG_SOURCE_SILENT_SEC = 120.0
+LOG_SOURCE_DROP_RATE = 0.25
+LOG_SOURCE_WINDOW_SEC = 60.0
+LOG_SOURCE_WINDOW_MIN_LINES = 4      # below this the previous window's rate is used
+
+
+class SubsystemHealth:
+    """Cached state of the four subsystems, updated where the calls happen.
+
+    The heartbeat only reads this. Nothing in here opens a socket or waits on
+    anything, so status() is safe from the event loop every 10s. One rule
+    governs every word it produces: never say ok for something that has not
+    been proven by a real call.
+
+      claude      unreachable  no credentials, or the last attempt failed
+                  degraded     credentials but no attempt yet; hourly ceiling
+                               reached (events queuing to digest); last call
+                               took over CLAUDE_SLOW_SEC
+                  ok           last attempt succeeded
+      ollama      unreachable  last call raised OllamaUnreachable
+                  degraded     rolling p50 over LATENCY_WARN_P50_SEC, or the
+                               last call needed a retry (schema retry counts)
+                  ok           otherwise
+      tts         unreachable  no engine, or the last render() failed
+                  degraded     espeak fallback, or ElevenLabs not yet proven
+                  ok           ElevenLabs rendered successfully
+      log_source  unreachable  a source is configured and nothing parsed in
+                               LOG_SOURCE_SILENT_SEC, or the source thread died
+                  degraded     malformed-line rate over LOG_SOURCE_DROP_RATE in
+                               the last window. Malformed = the syslog header
+                               did not match (RFC3339 timestamps, garbage).
+                               Lines that are well-formed but carry no
+                               signature (cron, sudo) are noise, not a fault.
+                  ok           otherwise
+
+    `clock` is monotonic seconds, injectable for tests.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.clock = clock
+        self._lock = threading.Lock()
+        # claude
+        self.claude_key_present = False
+        self.claude_attempts = 0
+        self.claude_last_ok: bool | None = None
+        self.claude_last_latency: float | None = None
+        self.claude_queued_at: float | None = None
+        # ollama
+        self.ollama_latencies: deque[float] = deque(maxlen=LATENCY_WINDOW)
+        self.ollama_last: str | None = None   # ok | retry | schema_failure | unreachable
+        # tts
+        self.tts_engine = "none"
+        self.tts_last_ok: bool | None = None
+        # log_source
+        self.log_source_configured = False
+        self.log_source_since: float | None = None
+        self.log_source_last_parsed: float | None = None
+        self.log_source_dead = False
+        self._ls_window_start = clock()
+        self._ls_lines = 0
+        self._ls_malformed = 0
+        self._ls_prev_rate = 0.0
+
+    # ------------------------------------------------------------ claude
+    def note_claude_key(self, present: bool) -> None:
+        self.claude_key_present = present
+
+    def note_claude_result(self, ok: bool, latency_sec: float) -> None:
+        with self._lock:
+            self.claude_attempts += 1
+            self.claude_last_ok = ok
+            self.claude_last_latency = latency_sec
+
+    def note_claude_queued(self, queued: bool) -> None:
+        with self._lock:
+            self.claude_queued_at = self.clock() if queued else None
+
+    def claude_state(self) -> str:
+        if not self.claude_key_present or self.claude_last_ok is False:
+            return "unreachable"
+        if self.claude_attempts == 0:
+            return "degraded"
+        if self.claude_queued_at is not None and self.clock() - self.claude_queued_at < CLAUDE_CEILING_SEC:
+            return "degraded"
+        if self.claude_last_latency is not None and self.claude_last_latency > CLAUDE_SLOW_SEC:
+            return "degraded"
+        return "ok"
+
+    # ------------------------------------------------------------ ollama
+    def note_ollama(self, result: str, latency_sec: float | None = None) -> None:
+        with self._lock:
+            self.ollama_last = result
+            if latency_sec is not None:
+                self.ollama_latencies.append(latency_sec)
+
+    @property
+    def ollama_p50(self) -> float | None:
+        return statistics.median(self.ollama_latencies) if self.ollama_latencies else None
+
+    def ollama_state(self) -> str:
+        if self.ollama_last == "unreachable":
+            return "unreachable"
+        if self.ollama_last in ("retry", "schema_failure"):
+            return "degraded"
+        p50 = self.ollama_p50
+        if p50 is not None and p50 > LATENCY_WARN_P50_SEC:
+            return "degraded"
+        return "ok"
+
+    # --------------------------------------------------------------- tts
+    def note_tts_engine(self, engine: str) -> None:
+        self.tts_engine = engine
+
+    def note_tts_render(self, ok: bool) -> None:
+        with self._lock:
+            self.tts_last_ok = ok
+
+    def tts_state(self) -> str:
+        if self.tts_engine == "none" or self.tts_last_ok is False:
+            return "unreachable"
+        if self.tts_engine == "elevenlabs" and self.tts_last_ok:
+            return "ok"
+        return "degraded"
+
+    # -------------------------------------------------------- log_source
+    def note_log_source_configured(self) -> None:
+        self.log_source_configured = True
+        self.log_source_since = self.clock()
+
+    def note_log_source_dead(self) -> None:
+        self.log_source_dead = True
+
+    def note_line(self, parsed: bool, malformed: bool) -> None:
+        now = self.clock()
+        with self._lock:
+            self._rotate(now)
+            self._ls_lines += 1
+            if malformed:
+                self._ls_malformed += 1
+            if parsed:
+                self.log_source_last_parsed = now
+
+    def _rotate(self, now: float) -> None:
+        if now - self._ls_window_start >= LOG_SOURCE_WINDOW_SEC:
+            if self._ls_lines >= LOG_SOURCE_WINDOW_MIN_LINES:
+                self._ls_prev_rate = self._ls_malformed / self._ls_lines
+            elif now - self._ls_window_start >= 2 * LOG_SOURCE_WINDOW_SEC:
+                self._ls_prev_rate = 0.0  # a quiet window says nothing about drops
+            self._ls_window_start, self._ls_lines, self._ls_malformed = now, 0, 0
+
+    def log_source_drop_rate(self) -> float:
+        with self._lock:
+            self._rotate(self.clock())
+            if self._ls_lines >= LOG_SOURCE_WINDOW_MIN_LINES:
+                return self._ls_malformed / self._ls_lines
+            return self._ls_prev_rate
+
+    def log_source_state(self) -> str:
+        if self.log_source_dead:
+            return "unreachable"
+        if self.log_source_configured:
+            ref = max(x for x in (self.log_source_since, self.log_source_last_parsed) if x is not None)
+            if self.clock() - ref > LOG_SOURCE_SILENT_SEC:
+                return "unreachable"
+        if self.log_source_drop_rate() > LOG_SOURCE_DROP_RATE:
+            return "degraded"
+        return "ok"
+
+    # ------------------------------------------------------------ status
+    def status(self) -> PipelineStatus:
+        """Cached state only. Never probes, never blocks."""
+        return PipelineStatus(
+            log_source=self.log_source_state(),  # type: ignore[arg-type]
+            ollama=self.ollama_state(),  # type: ignore[arg-type]
+            tts=self.tts_state(),  # type: ignore[arg-type]
+            claude=self.claude_state(),  # type: ignore[arg-type]
+        )
+
+
 # ------------------------------------------------------------------ stats
 @dataclass
 class PipelineStats:
@@ -166,6 +350,7 @@ class Pipeline:
         dry_run: bool = True,
         on_update: UpdateCallback | None = None,
         session_id: str | None = None,
+        health: SubsystemHealth | None = None,
     ) -> None:
         self.llm = llm
         self.parser = LineParser(year=year)
@@ -175,8 +360,14 @@ class Pipeline:
         self.executor = executor or Executor(self.db, self.assets, dry_run=dry_run)
         self.rate = rate or RateController(self.db)
         self.escalator = escalator
-        if self.escalator is not None and self.escalator.on_verdict is None:
-            self.escalator.on_verdict = self.on_verdict
+        # One health object, shared with the escalator so its worker thread
+        # records the outcome of every real call. The heartbeat reads it.
+        self.health = health or SubsystemHealth()
+        if self.escalator is not None:
+            if self.escalator.on_verdict is None:
+                self.escalator.on_verdict = self.on_verdict
+            self.escalator.health = self.health
+            self.health.note_claude_key(self.escalator.has_credentials)
         self.on_update = on_update
         self.session_id = session_id or f"s_{uuid7().hex[:12]}"
         self.stats = PipelineStats()
@@ -187,7 +378,16 @@ class Pipeline:
         self._recent: OrderedDict[str, EventData] = OrderedDict()
         self._pending_claude: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
-        self.log_source_state = "ok"
+
+    @property
+    def log_source_state(self) -> str:
+        return self.health.log_source_state()
+
+    @log_source_state.setter
+    def log_source_state(self, value: str) -> None:
+        """stub_server sets "unreachable" when the source thread dies."""
+        if value == "unreachable":
+            self.health.note_log_source_dead()
 
     # ------------------------------------------------------------ driving
     def run(self, lines: Iterable[str | TaggedLine | None]) -> Iterator[EventData]:
@@ -202,8 +402,10 @@ class Pipeline:
             else:
                 line, kind = item, None
             self.stats.lines += 1
+            malformed_before = self.parser.malformed
             parsed = self.parser.parse(line, kind)
             self.stats.parsed, self.stats.dropped = self.parser.parsed, self.parser.dropped
+            self.health.note_line(parsed is not None, malformed=self.parser.malformed > malformed_before)
             if parsed is None:
                 continue
             for agg in self.aggregator.add(parsed):
@@ -388,14 +590,34 @@ class Pipeline:
             self._persisted_tokens.update(pairs)
 
     # --------------------------------------------------------------- model
+    def _generate(self, mi: ModelInput, tokens: set[str]) -> OllamaOutput:
+        """One llm.generate() with the outcome recorded in health.
+
+        A schema retry inside the client shows up as its `retries` counter
+        moving; that is the "needed a retry" the heartbeat reports as degraded.
+        """
+        retries_before = getattr(self.llm, "retries", 0)
+        t0 = time.monotonic()
+        try:
+            out = self.llm.generate(mi, tokens)
+        except OllamaUnreachable:
+            self.health.note_ollama("unreachable", time.monotonic() - t0)
+            raise
+        except SchemaFailure:
+            self.health.note_ollama("schema_failure", time.monotonic() - t0)
+            raise
+        retried = getattr(self.llm, "retries", 0) > retries_before
+        self.health.note_ollama("retry" if retried else "ok", time.monotonic() - t0)
+        return out
+
     def _ask_model(self, mi: ModelInput, agg: AggregatedEvent) -> tuple[OllamaOutput, str]:
         tokens = self.rmap.tokens()
-        out = self.llm.generate(mi, tokens)
+        out = self._generate(mi, tokens)
         problems = validate_tts(out.tts_summary, tokens)
         if not problems:
             return out, out.tts_summary
         self.stats.tts_retries += 1
-        retry = self.llm.generate(mi, tokens)
+        retry = self._generate(mi, tokens)
         if not validate_tts(retry.tts_summary, tokens):
             return retry, retry.tts_summary
         self.stats.tts_fallbacks += 1
@@ -430,6 +652,9 @@ class Pipeline:
             return Escalation(escalated=False), "none"
         self.stats.escalations[decision.gate or "?"] = self.stats.escalations.get(decision.gate or "?", 0) + 1
         state, why = self.rate.admit(signature)
+        # Only the global ceiling is "Claude is degraded"; a per-signature
+        # cooldown is one signature waiting its turn, not the tier backing up.
+        self.health.note_claude_queued(state == QUEUED_DIGEST and getattr(self.rate, "global_ceiling_hit", False))
         if state == QUEUED_DIGEST:
             self.stats.escalations_queued += 1
             log.info("escalation for %s queued for digest: %s", signature, why)
@@ -464,12 +689,8 @@ class Pipeline:
 
     # -------------------------------------------------------------- status
     def status(self) -> PipelineStatus:
-        return PipelineStatus(
-            log_source=self.log_source_state,  # type: ignore[arg-type]
-            ollama=getattr(self.llm, "status", "ok"),  # type: ignore[arg-type]
-            tts="degraded",  # no TTS renderer in the backend yet; the server serves a silent clip
-            claude=self.escalator.status if self.escalator else "unreachable",  # type: ignore[arg-type]
-        )
+        """What the heartbeat sends. Cached SubsystemHealth only: no probing."""
+        return self.health.status()
 
     # ------------------------------------------------------------- entities
     @staticmethod
@@ -562,6 +783,7 @@ def build_from_args(
     escalator = ClaudeEscalator(db)
     pipe = Pipeline(llm=llm, window_sec=args.window, year=args.year, db=db, assets=assets,
                     executor=executor, escalator=escalator, dry_run=not live, on_update=on_update)
+    pipe.health.note_log_source_configured()  # from here on, silence is a fault
 
     listener: SyslogListener | None = None
     if args.fixture:
