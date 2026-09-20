@@ -71,6 +71,12 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
+    // Playback. The OkHttp data source is not optional: the audio URL sits
+    // behind the same pinned self-signed certificate and bearer token as the
+    // socket, and ExoPlayer's default HTTP stack knows about neither.
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-datasource-okhttp:1.4.1")
+
     // BiometricPrompt requires a FragmentActivity host.
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment-ktx:1.8.4")

@@ -75,8 +75,12 @@ object AppSettings {
     private val _currentSiteId = MutableStateFlow("home")
     val currentSiteId: StateFlow<String> = _currentSiteId.asStateFlow()
 
-    /** Speak alerts aloud through TTS. Off until the audio queue exists. */
-    private val _speakAlerts = MutableStateFlow(false)
+    /**
+     * Speak alerts aloud. On by default now that the queue and the backend
+     * renderer both exist -- an ambient voice SOC that starts muted is just a
+     * notification app until someone finds the switch.
+     */
+    private val _speakAlerts = MutableStateFlow(true)
     val speakAlerts: StateFlow<Boolean> = _speakAlerts.asStateFlow()
 
     /** Require biometric re-auth for every action, not just destructive ones. */

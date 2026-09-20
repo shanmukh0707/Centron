@@ -9,7 +9,11 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import com.centron.sentinel.audio.SpeechQueue
+import com.centron.sentinel.contract.AudioReadyFrame
 import com.centron.sentinel.contract.EventFrame
+import com.centron.sentinel.contract.Severity
+import com.centron.sentinel.data.EventDao
 import com.centron.sentinel.data.EventRepository
 import com.centron.sentinel.data.SentinelDatabase
 import com.centron.sentinel.net.ActiveClient
@@ -41,6 +45,7 @@ class SentinelService : Service() {
     private var client: SentinelClient? = null
     private var collectors: Job? = null
     private var activeConfig: EngineConfig? = null
+    private var speech: SpeechQueue? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -80,11 +85,24 @@ class SentinelService : Service() {
 
         Alerts.ensureChannels(this)
 
+        val dao = SentinelDatabase.get(this).events()
+        speech = SpeechQueue(applicationContext) { AppSettings.engineConfig.value }
+
         collectors = scope.launch {
             launch {
                 c.frames.collect { frame ->
                     repo.apply(frame, c)
-                    if (frame is EventFrame) raiseAlertIfNeeded(frame)
+                    when (frame) {
+                        is EventFrame -> {
+                            raiseAlertIfNeeded(frame)
+                            speakEvent(frame)
+                        }
+                        // Audio that arrived after its event. Nothing was
+                        // spoken at the time because there was nothing to
+                        // play; this is where the phone catches up.
+                        is AudioReadyFrame -> speakLateAudio(dao, frame)
+                        else -> Unit
+                    }
                 }
             }
             launch {
@@ -141,7 +159,48 @@ class SentinelService : Service() {
         )
     }
 
+    /**
+     * Speak an event, if the operator has speech on and the audio is ready.
+     *
+     * SpeechQueue enforces the severity contract; this only decides whether to
+     * offer it at all.
+     */
+    private fun speakEvent(frame: EventFrame) {
+        if (!AppSettings.speakAlerts.value) return
+        val d = frame.data
+        speech?.submit(
+            eventId = d.event_id,
+            severity = d.severity,
+            audioUrl = d.audio?.url,
+            cacheKey = d.audio?.cache_key,
+            audioStatus = d.audio?.status?.name?.lowercase(),
+        )
+    }
+
+    /**
+     * audio_ready carries only event_id and the audio ref, so severity has to
+     * come from the stored event. Room already has it: the event was written
+     * before this frame could arrive.
+     */
+    private suspend fun speakLateAudio(dao: EventDao, frame: AudioReadyFrame) {
+        if (!AppSettings.speakAlerts.value) return
+        val stored = dao.byId(frame.data.event_id) ?: return
+        val severity = runCatching {
+            Severity.valueOf(stored.severity.uppercase())
+        }.getOrNull() ?: return
+
+        speech?.submit(
+            eventId = frame.data.event_id,
+            severity = severity,
+            audioUrl = frame.data.audio.url,
+            cacheKey = frame.data.audio.cache_key,
+            audioStatus = frame.data.audio.status.name.lowercase(),
+        )
+    }
+
     override fun onDestroy() {
+        speech?.stop()
+        speech = null
         ActiveClient.publish(null)
         client?.disconnect()
         collectors?.cancel()
