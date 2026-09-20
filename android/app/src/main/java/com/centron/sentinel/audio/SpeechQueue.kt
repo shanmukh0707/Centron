@@ -2,8 +2,8 @@ package com.centron.sentinel.audio
 
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioManager
-import android.media.RingtoneManager
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.os.Build
 import android.os.CombinedVibration
 import android.os.Handler
@@ -78,9 +78,17 @@ class SpeechQueue(
     private val spoken = LinkedHashSet<String>()
     private var player: ExoPlayer? = null
     private var current: Utterance? = null
+    private var alarmTrack: AudioTrack? = null
 
     /** Bounded so a long session cannot grow this without limit. */
     private val spokenMax = 256
+
+    private companion object {
+        const val TONE_RATE = 44100
+        const val TONE_TOTAL_MS = 590L
+        /** Well below full scale: this plays under, then into, the speech. */
+        const val TONE_AMPLITUDE = 0.38
+    }
 
     // ------------------------------------------------------------------ api
 
@@ -127,6 +135,7 @@ class SpeechQueue(
         queue.clear()
         current = null
         main.post {
+            stopAlarm()
             player?.release()
             player = null
         }
@@ -257,27 +266,91 @@ class SpeechQueue(
 
     // ------------------------------------------------------------- critical
 
-    /** Short alarm tone ahead of the speech, so the words are not the first
-     *  thing a sleeping person has to parse. */
+    /**
+     * Two descending tones ahead of the speech, so the words are not the first
+     * thing a sleeping person has to parse.
+     *
+     * Synthesised rather than played from RingtoneManager, for two reasons.
+     * The system alarm tone loops by design and has to be told to stop, which
+     * is how it ended up running under the whole alert. And whatever the owner
+     * happens to have chosen is often cheerful, which is the wrong register
+     * for a message about someone attacking your network.
+     *
+     * A falling minor third at low pitch reads as an alert rather than a
+     * notification chime. Fixed length, so there is nothing to stop.
+     */
     private fun alarm() {
         try {
-            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-                ?: return
-            val ringtone = RingtoneManager.getRingtone(context, uri) ?: return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                ringtone.audioAttributes = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ALARM)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
-            } else {
-                @Suppress("DEPRECATION")
-                ringtone.streamType = AudioManager.STREAM_ALARM
-            }
-            ringtone.play()
+            stopAlarm()
+            val pcm = alertTone()
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(TONE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .setBufferSizeInBytes(pcm.size * 2)
+                .build()
+
+            track.write(pcm, 0, pcm.size)
+            track.play()
+            alarmTrack = track
+            // Released once it has certainly finished. Without this the track
+            // leaks, and enough criticals in a row exhaust the audio session.
+            main.postDelayed({ stopAlarm() }, TONE_TOTAL_MS + 300L)
         } catch (e: Exception) {
             Log.w(tag, "alarm tone failed: ${e.message}")
         }
+    }
+
+    private fun stopAlarm() {
+        val track = alarmTrack ?: return
+        alarmTrack = null
+        runCatching {
+            if (track.state == AudioTrack.STATE_INITIALIZED) track.stop()
+            track.release()
+        }
+    }
+
+    /**
+     * Two tones, G3 then E3, with short fades.
+     *
+     * The fades are not decoration: a square-edged start or end on a sine is
+     * an audible click, and a click at the front of an alert sounds like a
+     * fault in the app rather than part of the sound.
+     */
+    private fun alertTone(): ShortArray {
+        val toneMs = 260
+        val gapMs = 70
+        val toneSamples = TONE_RATE * toneMs / 1000
+        val gapSamples = TONE_RATE * gapMs / 1000
+        val out = ShortArray(toneSamples * 2 + gapSamples)
+
+        fun writeTone(offset: Int, freq: Double) {
+            val fade = TONE_RATE * 8 / 1000
+            for (i in 0 until toneSamples) {
+                val envelope = when {
+                    i < fade -> i.toDouble() / fade
+                    i > toneSamples - fade -> (toneSamples - i).toDouble() / fade
+                    else -> 1.0
+                }
+                val sample = kotlin.math.sin(2.0 * Math.PI * freq * i / TONE_RATE)
+                out[offset + i] = (sample * envelope * TONE_AMPLITUDE * Short.MAX_VALUE).toInt().toShort()
+            }
+        }
+
+        writeTone(0, 196.0)                                  // G3
+        writeTone(toneSamples + gapSamples, 164.81)          // E3
+        return out
     }
 
     private fun haptic() {
