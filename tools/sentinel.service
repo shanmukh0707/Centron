@@ -76,6 +76,13 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
+
+# ProtectHome=read-only covers /home, and the app lives in /home/pi/sentinel.
+# Without this exception the pipeline cannot create sentinel.db, the ingest
+# thread dies, and the server keeps serving heartbeats with no events — which
+# looks exactly like "nothing is attacking you" rather than a failure.
+# Narrower than dropping ProtectHome: only the app's own directory is writable.
+ReadWritePaths=__ROOT__/backend
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
