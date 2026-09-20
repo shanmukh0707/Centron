@@ -62,6 +62,7 @@ from pydantic import ValidationError
 
 import schemas as S
 from pipeline import Pipeline, add_pipeline_args, build_from_args
+from tts import Rendered, Renderer
 
 log = logging.getLogger("sentinel.stub")
 
@@ -126,6 +127,12 @@ class Hub:
     pipe: Pipeline | None = None
     suppressed: set = field(default_factory=set)   # event_ids dropped by --quiet
     quiet_dropped: int = 0
+    # Speech renderer. None means no renderer is wired, which the heartbeat
+    # reports as unreachable rather than pretending otherwise.
+    tts: Renderer | None = None
+    # Rendered audio, keyed on the contract's cache_key so a repeated phrase is
+    # synthesised once. audio_files maps ids; this maps content.
+    tts_cache: dict[str, Rendered] = field(default_factory=dict)
 
     # -- envelope -------------------------------------------------------------
     def next_seq(self) -> int:
@@ -187,23 +194,64 @@ class Hub:
         t.add_done_callback(self.tasks.discard)
 
     # -- audio ----------------------------------------------------------------
-    def new_audio(self, tts_summary: str, status: str = "ready") -> S.AudioRef:
-        audio_id = "aud_" + S.uuid7().hex[:16]
-        self.audio_files[audio_id] = SILENT_MP3
-        cache_key = "tts_" + hashlib.sha256(tts_summary.encode()).hexdigest()[:12]
-        if status != "ready":
-            return S.AudioRef(status=status, audio_id=audio_id, cache_key=cache_key)
+    @staticmethod
+    def cache_key_for(tts_summary: str) -> str:
+        return "tts_" + hashlib.sha256(tts_summary.encode()).hexdigest()[:12]
+
+    def _ref_from(self, audio_id: str, cache_key: str, r: Rendered) -> S.AudioRef:
+        self.audio_files[audio_id] = r.path
         return S.AudioRef(
             status="ready",
             audio_id=audio_id,
             url=f"{self.cfg.base_url}/audio/{audio_id}.mp3",
             mime="audio/mpeg",
-            duration_ms=1000,
-            sha256=self.silent_sha,
+            duration_ms=r.duration_ms,
+            sha256=r.sha256,
             cache_key=cache_key,
         )
 
-    def ready_version(self, pending: S.AudioRef) -> S.AudioRef:
+    def new_audio(self, tts_summary: str, status: str = "ready") -> S.AudioRef:
+        """An AudioRef for this phrase.
+
+        If the phrase is already rendered it comes back ready, with the real
+        duration and digest. Otherwise it comes back pending and the caller is
+        expected to schedule a render; the event must never wait on audio.
+        """
+        audio_id = "aud_" + S.uuid7().hex[:16]
+        cache_key = self.cache_key_for(tts_summary)
+
+        cached = self.tts_cache.get(cache_key)
+        if cached is not None and cached.path.exists():
+            return self._ref_from(audio_id, cache_key, cached)
+
+        if status != "ready" or self.tts is None or not self.tts.available:
+            # No renderer, or the caller wants pending. Falling back to the
+            # silent clip keeps the phone's fetch-and-play path exercised.
+            self.audio_files[audio_id] = SILENT_MP3
+            if status != "ready":
+                return S.AudioRef(status=status, audio_id=audio_id, cache_key=cache_key)
+            return S.AudioRef(
+                status="ready",
+                audio_id=audio_id,
+                url=f"{self.cfg.base_url}/audio/{audio_id}.mp3",
+                mime="audio/mpeg",
+                duration_ms=1000,
+                sha256=self.silent_sha,
+                cache_key=cache_key,
+            )
+
+        # Renderable but not yet rendered.
+        self.audio_files[audio_id] = SILENT_MP3
+        return S.AudioRef(status="pending", audio_id=audio_id, cache_key=cache_key)
+
+    def ready_version(self, pending: S.AudioRef, text: str | None = None) -> S.AudioRef:
+        """The ready form of a pending ref, using real audio when we have it."""
+        key = pending.cache_key or (self.cache_key_for(text) if text else None)
+        cached = self.tts_cache.get(key) if key else None
+        if cached is not None and cached.path.exists():
+            return self._ref_from(pending.audio_id, key, cached)
+
+        self.audio_files.setdefault(pending.audio_id, SILENT_MP3)
         return S.AudioRef(
             status="ready",
             audio_id=pending.audio_id,
@@ -213,6 +261,42 @@ class Hub:
             sha256=self.silent_sha,
             cache_key=pending.cache_key,
         )
+
+    def render_audio(self, event_id: Any, ref: S.AudioRef, text: str) -> None:
+        """Render off the event path, then announce with audio_ready.
+
+        Runs in a worker thread because espeak and an HTTP call to ElevenLabs
+        are both blocking, and the event loop is serving a live socket. The
+        event has already gone out by the time this starts.
+        """
+        if self.tts is None or not self.tts.available or ref.status == "ready":
+            return
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            rendered = await loop.run_in_executor(
+                None, self.tts.render, text, ref.cache_key or self.cache_key_for(text)
+            )
+            if rendered is None:
+                # Contract: never block an event on TTS. It already shipped;
+                # say the audio failed and move on.
+                await self.emit("audio_ready", S.AudioReadyData(
+                    event_id=event_id,
+                    audio=S.AudioRef(status="failed", audio_id=ref.audio_id,
+                                     cache_key=ref.cache_key),
+                ))
+                return
+
+            key = ref.cache_key or self.cache_key_for(text)
+            self.tts_cache[key] = rendered
+            await self.emit("audio_ready", S.AudioReadyData(
+                event_id=event_id,
+                audio=self._ref_from(ref.audio_id, key, rendered),
+            ))
+
+        # later() takes a factory, so a cancelled task never leaves an
+        # un-awaited coroutine behind at shutdown.
+        self.later(0.0, run)
 
     # -- approvals ------------------------------------------------------------
     def open_approval(self, event_id: Any, playbook: str, ttl_s: int = APPROVAL_TTL_S) -> Pending:
@@ -639,6 +723,15 @@ async def heartbeat_loop(hub: Hub) -> None:
 def heartbeat_data(hub: Hub) -> S.HeartbeatData:
     if hub.pipe is not None:
         hub.pipeline = hub.pipe.status()
+
+    # pipeline.status() hard-codes tts="degraded" because historically there
+    # was no renderer. Now there is, so report what it can actually do:
+    # ok on ElevenLabs, degraded on the local fallback, unreachable with
+    # neither. The phone shows this subsystem amber, and it should only be
+    # amber when it deserves to be.
+    if hub.tts is not None:
+        hub.pipeline = hub.pipeline.model_copy(update={"tts": hub.tts.status_word()})
+
     return S.HeartbeatData(
         interval_s=HEARTBEAT_S,
         uptime_s=int(time.monotonic() - hub.started),
@@ -676,8 +769,12 @@ async def scenario_loop(hub: Hub) -> None:
 
 
 def _with_audio(hub: Hub, ev: S.EventData) -> S.EventData:
-    """Attach the stub's silent clip so the phone's fetch/playback path runs.
-    info is never spoken, so it gets no audio at all."""
+    """Attach audio. info is never spoken, so it gets none at all.
+
+    A phrase already in the cache comes back ready immediately. Anything new
+    ships pending and the render is scheduled by the caller, because the event
+    must not wait for speech.
+    """
     if ev.audio is not None or ev.severity == "info":
         return ev
     return ev.model_copy(update={"audio": hub.new_audio(ev.tts_summary)})
@@ -689,9 +786,16 @@ async def _emit_pipeline_event(hub: Hub, ev: S.EventData, reemit: bool = False) 
             approval_id=ev.action.approval_id, event_id=ev.event_id,
             playbook=ev.action.playbook, expires_at=ev.action.expires_at,
         )
-    fr = await hub.emit("event", _with_audio(hub, ev))
+    with_audio = _with_audio(hub, ev)
+    fr = await hub.emit("event", with_audio)
     if hub.pipe is not None and not reemit:
         hub.pipe.db.update_event(ev.event_id, seq=fr.seq)
+
+    # Speech starts only after the event is on the wire. A re-emit carries the
+    # same phrase, so the cache answers it and no second render happens.
+    ref = with_audio.audio
+    if ref is not None and ref.status == "pending":
+        hub.render_audio(ev.event_id, ref, with_audio.tts_summary)
 
 
 async def pipeline_loop(hub: Hub) -> None:
@@ -873,6 +977,7 @@ async def lifespan(app: FastAPI):
     HUB = Hub(cfg=CONFIG)
     HUB.silent_sha = ensure_silent_mp3(SILENT_MP3)
     HUB.audio_files["silence"] = SILENT_MP3
+    HUB.tts = Renderer()
     source_loop = pipeline_loop if CONFIG.source == "pipeline" else scenario_loop
     loops = [asyncio.create_task(c(HUB)) for c in (heartbeat_loop, source_loop, expiry_loop)]
     log.info("stub up: ws://%s:%d/ws  audio base %s  source=%s scenario=%s rate=%.1f/min quiet=%s",
