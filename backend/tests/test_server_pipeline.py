@@ -135,6 +135,19 @@ def test_approval_over_socket_calls_executor_and_reports_true_outcome(pipeline_f
 
 
 def test_pipeline_events_carry_audio_except_info(pipeline_frames):
+    """info is silent; everything else carries an audio ref.
+
+    The status is deliberately not pinned to "ready". With a TTS renderer
+    present the first emission is "pending" and an audio_ready frame follows,
+    which is what contracts.md requires -- never block an event on TTS. With no
+    renderer the server attaches its silent clip and the ref is "ready"
+    immediately.
+
+    Asserting "ready" here made the outcome depend on whether espeak-ng happened
+    to be installed on the machine running the suite: green on a dev laptop, red
+    on serverpi. The invariant that actually matters is that a spoken severity
+    always gets a ref, and info never does.
+    """
     frames, _ = pipeline_frames
     for f in frames:
         if f.type != "event":
@@ -142,7 +155,9 @@ def test_pipeline_events_carry_audio_except_info(pipeline_frames):
         if f.data.severity == "info":
             assert f.data.audio is None
         else:
-            assert f.data.audio is not None and f.data.audio.status == "ready"
+            assert f.data.audio is not None
+            assert f.data.audio.status in ("ready", "pending")
+            assert f.data.audio.cache_key  # needed to dedupe speech later
 
 
 def test_heartbeat_reflects_pipeline_subsystems():
